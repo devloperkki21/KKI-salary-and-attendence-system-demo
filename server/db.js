@@ -3,6 +3,15 @@ const https = require('https');
 const { createClient } = require('@supabase/supabase-js');
 const { Pool } = require('pg');
 
+// Persistent HTTP Keep-Alive Agent for high-throughput, low-latency connection pooling
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 60,
+  maxFreeSockets: 30,
+  keepAliveMsecs: 60000,
+  timeout: 30000
+});
+
 // Environment variables configuration for Supabase PostgreSQL
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://drladbxpfnapxjmoxqhj.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImRybGFkYnhwZm5hcHhqbW94cWhqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc4NDk1Mjg1NiwiZXhwIjoyMTAwNTI4ODU2fQ.mZnJirgz88R9U8Dx2bCye8-gObEQXLcWMz4-EEcS7XQ';
@@ -132,6 +141,7 @@ function querySupabaseDirect(sql, timeoutMs = 25000) {
     const postData = JSON.stringify({ query: schemaPrefix + sql });
     const options = {
       hostname: 'api.supabase.com',
+      agent: httpsAgent,
       port: 443,
       path: `/v1/projects/${SUPABASE_PROJECT_REF}/database/query`,
       method: 'POST',
@@ -336,7 +346,18 @@ async function initDatabase() {
  * Deprecated: Full state is permanently stored in Supabase PostgreSQL cloud database.
  * No longer overwrites local disk or seed files.
  */
+let cacheInvalidator = null;
+function setCacheInvalidator(fn) {
+  cacheInvalidator = fn;
+}
+function invalidateDatabaseCache() {
+  if (typeof cacheInvalidator === 'function') {
+    try { cacheInvalidator(); } catch (e) {}
+  }
+}
+
 async function backupDatabaseToSeed() {
+  invalidateDatabaseCache();
   return true;
 }
 
@@ -354,4 +375,6 @@ module.exports = {
   batch,
   initDatabase,
   backupDatabaseToSeed,
+  setCacheInvalidator,
+  invalidateDatabaseCache,
 };

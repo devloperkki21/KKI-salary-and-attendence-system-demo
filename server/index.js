@@ -4,7 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
-const { execute, batch, initDatabase, backupDatabaseToSeed } = require('./db');
+const { execute, batch, initDatabase, backupDatabaseToSeed, setCacheInvalidator } = require('./db');
 const {
   queryCloud,
   syncAttendanceToCloud,
@@ -105,30 +105,94 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
-// Helper: Fetch all settings as key-value map
+// ==========================================
+// --- Ultra-Fast In-Memory Caching Layer ---
+// ==========================================
+const memoryCache = {
+  settings: null,
+  settingsExpiresAt: 0,
+  salaryRules: null,
+  salaryRulesExpiresAt: 0,
+  customRules: null,
+  customRulesExpiresAt: 0,
+  calendarMap: null,
+  calendarMapExpiresAt: 0,
+  months: null,
+  monthsExpiresAt: 0,
+  dashboard: new Map(),
+  workers: new Map(),
+};
+
+function invalidateAppCache() {
+  memoryCache.settings = null;
+  memoryCache.settingsExpiresAt = 0;
+  memoryCache.salaryRules = null;
+  memoryCache.salaryRulesExpiresAt = 0;
+  memoryCache.customRules = null;
+  memoryCache.customRulesExpiresAt = 0;
+  memoryCache.calendarMap = null;
+  memoryCache.calendarMapExpiresAt = 0;
+  memoryCache.months = null;
+  memoryCache.monthsExpiresAt = 0;
+  memoryCache.dashboard.clear();
+  memoryCache.workers.clear();
+  if (auth && typeof auth.invalidateAuthConfigCache === 'function') {
+    auth.invalidateAuthConfigCache();
+  }
+}
+
+if (typeof setCacheInvalidator === 'function') {
+  setCacheInvalidator(invalidateAppCache);
+}
+
+// Helper: Fetch all settings as key-value map (Cached with 60s TTL)
 async function getSettingsMap() {
+  const now = Date.now();
+  if (memoryCache.settings && now < memoryCache.settingsExpiresAt) {
+    return { ...memoryCache.settings };
+  }
   const rows = await execute(`SELECT key, value FROM settings`);
   const settings = {};
   rows.rows.forEach(r => {
     settings[r.key] = r.value;
   });
-  return settings;
+  memoryCache.settings = settings;
+  memoryCache.settingsExpiresAt = now + 60000;
+  return { ...settings };
 }
 
-// Helper: Fetch active custom rules (timing-based)
+// Helper: Fetch active custom rules (timing-based, cached)
 async function getCustomRules() {
+  const now = Date.now();
+  if (memoryCache.customRules && now < memoryCache.customRulesExpiresAt) {
+    return [...memoryCache.customRules];
+  }
   const res = await execute(`SELECT * FROM custom_rules WHERE is_active = 1`);
-  return res.rows || [];
+  const rules = res.rows || [];
+  memoryCache.customRules = rules;
+  memoryCache.customRulesExpiresAt = now + 60000;
+  return [...rules];
 }
 
-// Helper: Fetch active custom salary rules (bonus/deduction)
+// Helper: Fetch active custom salary rules (bonus/deduction, cached)
 async function getSalaryRules() {
+  const now = Date.now();
+  if (memoryCache.salaryRules && now < memoryCache.salaryRulesExpiresAt) {
+    return [...memoryCache.salaryRules];
+  }
   const res = await execute(`SELECT * FROM custom_salary_rules WHERE is_active = 1`);
-  return res.rows || [];
+  const rules = res.rows || [];
+  memoryCache.salaryRules = rules;
+  memoryCache.salaryRulesExpiresAt = now + 60000;
+  return [...rules];
 }
 
-// Helper: Fetch all configured Factory Calendar Overrides (YYYY-MM-DD -> { id, date, day_type, title, notes, is_recurring })
+// Helper: Fetch all configured Factory Calendar Overrides (cached)
 async function getFactoryCalendarMap() {
+  const now = Date.now();
+  if (memoryCache.calendarMap && now < memoryCache.calendarMapExpiresAt) {
+    return { ...memoryCache.calendarMap };
+  }
   try {
     const res = await execute(`SELECT * FROM factory_calendar ORDER BY date ASC`);
     const map = {};
@@ -142,7 +206,9 @@ async function getFactoryCalendarMap() {
         is_recurring: r.is_recurring ? 1 : 0
       };
     });
-    return map;
+    memoryCache.calendarMap = map;
+    memoryCache.calendarMapExpiresAt = now + 60000;
+    return { ...map };
   } catch (e) {
     return {};
   }
@@ -1168,6 +1234,7 @@ app.post('/api/attendance/clear-range', async (req, res) => {
 
 // Helper: Recompute all daily attendance with current settings
 async function recomputeAllAttendance() {
+  invalidateAppCache();
   const settings = await getSettingsMap();
   const customRules = await getCustomRules();
   const factoryCalendarMap = await getFactoryCalendarMap();
@@ -1324,9 +1391,13 @@ app.post('/api/attendance/recalculate', async (req, res) => {
   }
 });
 
-// 4b. GET All Available Uploaded Months
+// 4b. GET All Available Uploaded Months (Cached with 60s TTL)
 app.get('/api/months', async (req, res) => {
   try {
+    const now = Date.now();
+    if (memoryCache.months && now < memoryCache.monthsExpiresAt) {
+      return res.json({ success: true, months: memoryCache.months });
+    }
     const rowsRes = await execute(`
       SELECT DISTINCT SUBSTR(date, 1, 7) as month_key 
       FROM daily_attendance 
@@ -1348,6 +1419,8 @@ app.get('/api/months', async (req, res) => {
         monthName: name,
       };
     });
+    memoryCache.months = months;
+    memoryCache.monthsExpiresAt = now + 60000;
     res.json({ success: true, months });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -1647,6 +1720,13 @@ app.get('/api/attendance/all', async (req, res) => {
 app.get('/api/workers', async (req, res) => {
   try {
     const { month } = req.query;
+    const cacheKey = month || 'all';
+    const now = Date.now();
+    const cached = memoryCache.workers.get(cacheKey);
+    if (cached && now < cached.expiresAt) {
+      return res.json(cached.data);
+    }
+
     const settings = await getSettingsMap();
     const salaryRules = await getSalaryRules();
 
@@ -1755,7 +1835,9 @@ app.get('/api/workers', async (req, res) => {
       };
     });
 
-    res.json({ success: true, workers: resultList });
+    const workersPayload = { success: true, workers: resultList };
+    memoryCache.workers.set(cacheKey, { data: workersPayload, expiresAt: now + 30000 });
+    res.json(workersPayload);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -2602,9 +2684,16 @@ function detectActiveMonthDetails(minDate, maxDate) {
 // 10. GET Dashboard Metrics (OPTIMIZED - Parallel Batch Fetch with Active Month Detection, optional ?month=YYYY-MM)
 app.get('/api/dashboard', async (req, res) => {
   try {
+    const { month } = req.query;
+    const cacheKey = month || 'all';
+    const now = Date.now();
+    const cached = memoryCache.dashboard.get(cacheKey);
+    if (cached && now < cached.expiresAt) {
+      return res.json(cached.data);
+    }
+
     const settings = await getSettingsMap();
     const salaryRules = await getSalaryRules();
-    const { month } = req.query;
 
     const isMonthFiltered = month && month !== 'all';
     const dateCond = isMonthFiltered ? ` WHERE date LIKE ? ` : '';
@@ -2661,15 +2750,16 @@ app.get('/api/dashboard', async (req, res) => {
         )
       `;
 
-    // Execute all count queries in parallel
-    const [workersCountRes, recordsCountRes, statusCountsRes, workersRes, allAttendanceRes, allAdvancesRes, dateBoundsRes] = await Promise.all([
+    // Execute all count queries and incomplete calculation in parallel
+    const [workersCountRes, recordsCountRes, statusCountsRes, workersRes, allAttendanceRes, allAdvancesRes, dateBoundsRes, incompleteCount] = await Promise.all([
       execute(workersCountSql, isMonthFiltered ? [`${month}%`] : []),
       execute(`SELECT COUNT(*) as cnt FROM daily_attendance ${whereDaily}`, dateParams),
       execute(`SELECT status, COUNT(*) as cnt FROM daily_attendance ${whereDaily} GROUP BY status`, dateParams),
       execute(workersSql, isMonthFiltered ? [`${month}%`] : []),
       execute(`SELECT * FROM daily_attendance ${whereDaily} ORDER BY staff_no`, dateParams),
       execute(`SELECT * FROM advances ${whereAdvances} ORDER BY staff_no`, dateParams),
-      execute(`SELECT MIN(date) as min_date, MAX(date) as max_date FROM daily_attendance ${whereBounds}`, isMonthFiltered ? [`${month}%`] : [])
+      execute(`SELECT MIN(date) as min_date, MAX(date) as max_date FROM daily_attendance ${whereBounds}`, isMonthFiltered ? [`${month}%`] : []),
+      getTrueIncompleteCount(month)
     ]);
 
     const totalWorkers = workersCountRes.rows[0]?.cnt || 0;
@@ -2696,9 +2786,6 @@ app.get('/api/dashboard', async (req, res) => {
     } else {
       activeMonth = detectActiveMonthDetails(minDate, maxDate);
     }
-
-    // Calculate verified true incomplete count
-    const incompleteCount = await getTrueIncompleteCount(month);
 
     const statusBreakdown = {};
     statusCountsRes.rows.forEach(r => { statusBreakdown[r.status] = r.cnt; });
@@ -2743,7 +2830,7 @@ app.get('/api/dashboard', async (req, res) => {
       grandNet += p.netPayable;
     });
 
-    res.json({
+    const dashPayload = {
       success: true,
       metrics: {
         totalWorkers,
@@ -2755,7 +2842,9 @@ app.get('/api/dashboard', async (req, res) => {
         statusBreakdown,
         activeMonth,
       },
-    });
+    };
+    memoryCache.dashboard.set(cacheKey, { data: dashPayload, expiresAt: now + 30000 });
+    res.json(dashPayload);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
