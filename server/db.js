@@ -222,7 +222,7 @@ async function execute(sql, args = []) {
  */
 async function batch(statements) {
   if (!statements || statements.length === 0) return [];
-  const BATCH_SIZE = 50;
+  const BATCH_SIZE = 500;
   const allResults = [];
 
   for (let i = 0; i < statements.length; i += BATCH_SIZE) {

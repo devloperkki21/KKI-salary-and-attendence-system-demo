@@ -970,21 +970,31 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
       }
     }
 
-    // Shield 1: Clean overwrite ONLY for non-overridden records of the exact dates present in the uploaded file
-    // CRITICAL: NEVER delete future dates of the month that are not in the uploaded file!
-    if (datesSet.size > 0) {
+    // Shield 1: Clean overwrite ONLY for non-overridden records of the exact workers & dates in the uploaded file
+    // CRITICAL: Protect other workers who are not in this file from being wiped out!
+    if (datesSet.size > 0 && parsedWorkers.length > 0) {
       const datesArray = Array.from(datesSet);
-      for (let i = 0; i < datesArray.length; i += 50) {
-        const chunk = datesArray.slice(i, i + 50);
-        const placeholders = chunk.map(() => '?').join(',');
-        await execute(`DELETE FROM daily_attendance WHERE date IN (${placeholders}) AND (is_manual_override = 0 OR is_manual_override IS NULL)`, chunk);
-        await execute(`DELETE FROM raw_punches WHERE date IN (${placeholders})`, chunk);
+      const staffArray = parsedWorkers.map(w => w.staff_no).filter(Boolean);
+      if (staffArray.length > 0) {
+        const staffPlaceholders = staffArray.map(() => '?').join(',');
+        for (let i = 0; i < datesArray.length; i += 50) {
+          const chunk = datesArray.slice(i, i + 50);
+          const datePlaceholders = chunk.map(() => '?').join(',');
+          await execute(
+            `DELETE FROM daily_attendance WHERE staff_no IN (${staffPlaceholders}) AND date IN (${datePlaceholders}) AND (is_manual_override = 0 OR is_manual_override IS NULL)`,
+            [...staffArray, ...chunk]
+          );
+          await execute(
+            `DELETE FROM raw_punches WHERE staff_no IN (${staffPlaceholders}) AND date IN (${datePlaceholders})`,
+            [...staffArray, ...chunk]
+          );
+        }
       }
     }
 
-    // High-speed chunked batch execution (chunks of 150 statements)
-    for (let i = 0; i < dbStatements.length; i += 150) {
-      const chunk = dbStatements.slice(i, i + 150);
+    // High-speed chunked batch execution (chunks of 500 statements)
+    for (let i = 0; i < dbStatements.length; i += 500) {
+      const chunk = dbStatements.slice(i, i + 500);
       await batch(chunk);
     }
 
@@ -1132,8 +1142,8 @@ app.post('/api/upload/commit', async (req, res) => {
       }
     }
 
-    for (let i = 0; i < dbStatements.length; i += 150) {
-      const chunk = dbStatements.slice(i, i + 150);
+    for (let i = 0; i < dbStatements.length; i += 500) {
+      const chunk = dbStatements.slice(i, i + 500);
       await batch(chunk);
     }
 
