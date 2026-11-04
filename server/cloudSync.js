@@ -13,7 +13,7 @@ function escapeSqlVal(val) {
   return `'${str}'`;
 }
 
-function queryCloud(query, timeoutMs = 12000) {
+function queryCloud(query, timeoutMs = 15000) {
   return new Promise((resolve) => {
     if (!PAT || !PROJECT_REF) {
       return resolve({ success: false, error: 'Missing cloud credentials' });
@@ -65,6 +65,46 @@ function queryCloud(query, timeoutMs = 12000) {
 }
 
 /**
+ * Execute Cloud Query with automatic sequence self-repair on duplicate key
+ */
+async function executeCloudWithRetry(sql, tableName = '', timeoutMs = 15000) {
+  let res = await queryCloud(sql, timeoutMs);
+  if (!res.success && String(res.error).includes('duplicate key value violates unique constraint') && tableName) {
+    console.warn(`⚠️ Cloud sequence collision detected on ${tableName}. Auto-repairing sequence and retrying...`);
+    const fixSql = `SELECT setval('${tableName}_id_seq', (SELECT COALESCE(MAX(id), 0) + 1 FROM "${tableName}"), false);`;
+    await queryCloud(fixSql, 5000);
+    res = await queryCloud(sql, timeoutMs);
+  }
+  if (!res.success) {
+    console.warn(`⚠️ Supabase Cloud sync warning (${tableName || 'query'}):`, res.error || res);
+  }
+  return res;
+}
+
+/**
+ * Calibrate all PostgreSQL table sequences on Supabase Cloud
+ */
+async function calibrateCloudSequences() {
+  const seqTables = [
+    { seq: 'daily_attendance_id_seq', tbl: 'daily_attendance' },
+    { seq: 'raw_punches_id_seq', tbl: 'raw_punches' },
+    { seq: 'audit_logs_id_seq', tbl: 'audit_logs' },
+    { seq: 'workers_id_seq', tbl: 'workers' },
+    { seq: 'advances_id_seq', tbl: 'advances' },
+    { seq: 'rule_profiles_id_seq', tbl: 'rule_profiles' },
+    { seq: 'custom_rules_id_seq', tbl: 'custom_rules' },
+    { seq: 'custom_salary_rules_id_seq', tbl: 'custom_salary_rules' },
+    { seq: 'paid_holidays_id_seq', tbl: 'paid_holidays' },
+    { seq: 'factory_calendar_id_seq', tbl: 'factory_calendar' }
+  ];
+  for (const t of seqTables) {
+    try {
+      await queryCloud(`SELECT setval('${t.seq}', (SELECT COALESCE(MAX(id), 0) + 1 FROM "${t.tbl}"), false);`, 4000);
+    } catch (e) {}
+  }
+}
+
+/**
  * Check if cloud database is reachable
  */
 async function isCloudAvailable() {
@@ -107,16 +147,17 @@ async function getCloudStatus() {
  * Preserves existing manual overrides in cloud as well!
  */
 async function syncAttendanceToCloud(records) {
-  if (!records || records.length === 0) return;
+  if (!records || records.length === 0) return { success: true, count: 0 };
   const BATCH_SIZE = 200;
 
   const cols = [
     'staff_no', 'date', 'weekday', 'raw_swipes', 'original_raw_swipes', 'manual_punches',
     'effective_in', 'effective_out', 'regular_hours', 'ot_hours', 'sunday_ot_hours',
-    'total_hours', 'late_minutes', 'status', 'shift', 'is_manual_override', 'override_reason'
+    'total_hours', 'late_minutes', 'status', 'shift', 'is_manual_override', 'override_reason', 'forfeiture_reason'
   ];
   const colList = cols.map(c => `"${c}"`).join(', ');
 
+  let totalSynced = 0;
   for (let i = 0; i < records.length; i += BATCH_SIZE) {
     const chunk = records.slice(i, i + BATCH_SIZE);
     const valList = chunk.map(r => {
@@ -141,26 +182,26 @@ async function syncAttendanceToCloud(records) {
         shift = CASE WHEN EXCLUDED.is_manual_override = 1 THEN EXCLUDED.shift WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.shift ELSE EXCLUDED.shift END,
         status = CASE WHEN EXCLUDED.is_manual_override = 1 THEN EXCLUDED.status WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.status ELSE EXCLUDED.status END,
         is_manual_override = GREATEST(COALESCE(daily_attendance.is_manual_override, 0), COALESCE(EXCLUDED.is_manual_override, 0)),
-        override_reason = CASE WHEN EXCLUDED.is_manual_override = 1 THEN EXCLUDED.override_reason WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.override_reason ELSE EXCLUDED.override_reason END;
+        override_reason = CASE WHEN EXCLUDED.is_manual_override = 1 THEN EXCLUDED.override_reason WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.override_reason ELSE EXCLUDED.override_reason END,
+        forfeiture_reason = CASE WHEN EXCLUDED.is_manual_override = 1 THEN EXCLUDED.forfeiture_reason WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.forfeiture_reason ELSE EXCLUDED.forfeiture_reason END;
     `;
 
-    try {
-      await queryCloud(sql);
-    } catch (e) {
-      console.warn('⚠️ Cloud attendance sync chunk warning:', e.message);
-    }
+    const res = await executeCloudWithRetry(sql, 'daily_attendance');
+    if (res.success) totalSynced += chunk.length;
   }
+  return { success: true, count: totalSynced };
 }
 
 /**
  * Mirror raw punches to cloud
  */
 async function syncRawPunchesToCloud(punches) {
-  if (!punches || punches.length === 0) return;
+  if (!punches || punches.length === 0) return { success: true, count: 0 };
   const BATCH_SIZE = 250;
   const cols = ['staff_no', 'date', 'weekday', 'swipe_record', 'machine_work_time', 'batch_id'];
   const colList = cols.map(c => `"${c}"`).join(', ');
 
+  let totalSynced = 0;
   for (let i = 0; i < punches.length; i += BATCH_SIZE) {
     const chunk = punches.slice(i, i + BATCH_SIZE);
     const valList = chunk.map(r => {
@@ -177,26 +218,24 @@ async function syncRawPunchesToCloud(punches) {
         batch_id = COALESCE(EXCLUDED.batch_id, raw_punches.batch_id);
     `;
 
-    try {
-      await queryCloud(sql);
-    } catch (e) {
-      console.warn('⚠️ Cloud punch sync chunk warning:', e.message);
-    }
+    const res = await executeCloudWithRetry(sql, 'raw_punches');
+    if (res.success) totalSynced += chunk.length;
   }
+  return { success: true, count: totalSynced };
 }
 
 /**
  * Mirror single attendance record update (e.g. from manual edit or fast-fix) to cloud
  */
 async function syncSingleAttendanceToCloud(record) {
-  if (!record || !record.staff_no || !record.date) return;
+  if (!record || !record.staff_no || !record.date) return { success: false, error: 'Missing staff_no or date' };
   const cols = [
     'staff_no', 'date', 'weekday', 'raw_swipes', 'original_raw_swipes', 'manual_punches',
     'effective_in', 'effective_out', 'regular_hours', 'ot_hours', 'sunday_ot_hours',
-    'total_hours', 'late_minutes', 'status', 'shift', 'is_manual_override', 'override_reason'
+    'total_hours', 'late_minutes', 'status', 'shift', 'is_manual_override', 'override_reason', 'forfeiture_reason'
   ];
   const colList = cols.map(c => `"${c}"`).join(', ');
-  const vals = cols.map(c => escapeSqlVal(record[c] !== undefined ? record[c] : ''));
+  const vals = cols.map(c => escapeSqlVal(record[c] !== undefined ? record[c] : (c === 'is_manual_override' ? 0 : '')));
 
   const sql = `
     INSERT INTO "daily_attendance" (${colList}) VALUES
@@ -215,14 +254,11 @@ async function syncSingleAttendanceToCloud(record) {
       shift = EXCLUDED.shift,
       status = EXCLUDED.status,
       is_manual_override = EXCLUDED.is_manual_override,
-      override_reason = EXCLUDED.override_reason;
+      override_reason = EXCLUDED.override_reason,
+      forfeiture_reason = EXCLUDED.forfeiture_reason;
   `;
 
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud single attendance sync warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'daily_attendance');
 }
 
 /**
@@ -234,12 +270,8 @@ async function syncAuditLogToCloud(log) {
   const colList = cols.map(c => `"${c}"`).join(', ');
   const vals = cols.map(c => escapeSqlVal(log[c] !== undefined ? log[c] : ''));
 
-  const sql = `INSERT INTO "audit_logs" (${colList}) VALUES (${vals.join(', ')});`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud audit log sync warning:', e.message);
-  }
+  const sql = `INSERT INTO "audit_logs" (${colList}) VALUES (${vals.join(', ')});QueryCloudRetry`;
+  return executeCloudWithRetry(`INSERT INTO "audit_logs" (${colList}) VALUES (${vals.join(', ')});`, 'audit_logs');
 }
 
 /**
@@ -268,11 +300,7 @@ async function syncWorkerToCloud(worker) {
       is_exception = EXCLUDED.is_exception,
       exception_reason = EXCLUDED.exception_reason;
   `;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud worker sync warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'workers');
 }
 
 /**
@@ -281,11 +309,7 @@ async function syncWorkerToCloud(worker) {
 async function deleteWorkerFromCloud(staff_no) {
   if (!staff_no) return;
   const sql = `DELETE FROM "workers" WHERE staff_no = ${escapeSqlVal(staff_no)};`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud worker delete warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'workers');
 }
 
 /**
@@ -298,11 +322,7 @@ async function syncAdvanceToCloud(advance) {
   const vals = cols.map(c => escapeSqlVal(advance[c] !== undefined ? advance[c] : ''));
 
   const sql = `INSERT INTO "advances" (${colList}) VALUES (${vals.join(', ')});`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud advance sync warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'advances');
 }
 
 /**
@@ -311,11 +331,7 @@ async function syncAdvanceToCloud(advance) {
 async function deleteAdvanceFromCloud(id) {
   if (!id) return;
   const sql = `DELETE FROM "advances" WHERE id = ${parseInt(id, 10)};`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud advance delete warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'advances');
 }
 
 /**
@@ -328,11 +344,7 @@ async function syncSettingToCloud(key, value, description = '') {
     VALUES (${escapeSqlVal(key)}, ${escapeSqlVal(value)}, ${escapeSqlVal(description)})
     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
   `;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud setting sync warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'settings');
 }
 
 /**
@@ -349,11 +361,7 @@ async function syncCustomRuleToCloud(rule) {
   const vals = cols.map(c => escapeSqlVal(rule[c] !== undefined ? rule[c] : ''));
 
   const sql = `INSERT INTO "custom_rules" (${colList}) VALUES (${vals.join(', ')});`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud custom rule sync warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'custom_rules');
 }
 
 /**
@@ -362,11 +370,7 @@ async function syncCustomRuleToCloud(rule) {
 async function deleteCustomRuleFromCloud(id) {
   if (!id) return;
   const sql = `DELETE FROM "custom_rules" WHERE id = ${parseInt(id, 10)};`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud custom rule delete warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'custom_rules');
 }
 
 /**
@@ -383,11 +387,7 @@ async function syncSalaryRuleToCloud(rule) {
   const vals = cols.map(c => escapeSqlVal(rule[c] !== undefined ? rule[c] : ''));
 
   const sql = `INSERT INTO "custom_salary_rules" (${colList}) VALUES (${vals.join(', ')});`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud custom salary rule sync warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'custom_salary_rules');
 }
 
 /**
@@ -396,11 +396,7 @@ async function syncSalaryRuleToCloud(rule) {
 async function deleteSalaryRuleFromCloud(id) {
   if (!id) return;
   const sql = `DELETE FROM "custom_salary_rules" WHERE id = ${parseInt(id, 10)};`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud custom salary rule delete warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'custom_salary_rules');
 }
 
 /**
@@ -420,11 +416,7 @@ async function syncCalendarToCloud(entry) {
       notes = EXCLUDED.notes,
       is_recurring = EXCLUDED.is_recurring;
   `;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud calendar sync warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'factory_calendar');
 }
 
 /**
@@ -433,17 +425,11 @@ async function syncCalendarToCloud(entry) {
 async function deleteCalendarFromCloud(date) {
   if (!date) return;
   const sql = `DELETE FROM "factory_calendar" WHERE date = ${escapeSqlVal(date)};`;
-  try {
-    await queryCloud(sql);
-  } catch (e) {
-    console.warn('⚠️ Cloud calendar delete warning:', e.message);
-  }
+  return executeCloudWithRetry(sql, 'factory_calendar');
 }
 
 /**
- * Self-healing recovery: On server startup, if local SQLite has fewer records
- * than cloud (e.g. fresh Render container boot where data was created on Render),
- * pull down the missing records into local SQLite and update seed_data.json!
+ * Self-healing recovery: Bidirectionally synchronizes local SQLite with Supabase Cloud on boot.
  */
 async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
   try {
@@ -454,6 +440,9 @@ async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
     }
 
     console.log('📡 Supabase Cloud Connected! Checking for cloud data to hydrate local container...');
+
+    // 0. Proactively calibrate all PostgreSQL sequences on boot
+    await calibrateCloudSequences();
 
     // 1. Hydrate Workers from Supabase
     try {
@@ -547,25 +536,27 @@ async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
       console.warn('Calendar cloud hydration warning:', cErr.message);
     }
 
-    // 5. Hydrate Raw Punches from Supabase
+    // 5. Hydrate Raw Punches from Supabase (Full coverage without skipping prior dates)
     try {
       const cloudPunchCountRes = await queryCloud('SELECT count(*) as cnt, max(date) as max_date FROM raw_punches;', 5000);
       const localPunchCountRes = await executeLocal('SELECT count(*) as cnt, max(date) as max_date FROM raw_punches');
       const cloudPCount = parseInt(cloudPunchCountRes.data?.[0]?.cnt || 0, 10);
       const localPCount = parseInt(localPunchCountRes.rows[0]?.cnt || 0, 10);
-      const localMaxDate = localPunchCountRes.rows[0]?.max_date || '';
 
-      if (cloudPCount > localPCount) {
-        console.log(`📥 Hydrating missing punches from Supabase Cloud (Cloud: ${cloudPCount}, Local: ${localPCount})...`);
+      if (cloudPCount > localPCount || localPCount === 0) {
+        console.log(`📥 Hydrating punches from Supabase Cloud (Cloud: ${cloudPCount}, Local: ${localPCount})...`);
         const missingPunchesRes = await queryCloud(
-          `SELECT staff_no, date, weekday, swipe_record, machine_work_time, batch_id FROM raw_punches WHERE date > ${escapeSqlVal(localMaxDate)} OR ${localPCount === 0 ? '1=1' : '1=0'};`,
-          15000
+          `SELECT staff_no, date, weekday, swipe_record, machine_work_time, batch_id FROM raw_punches ORDER BY date ASC;`,
+          25000
         );
         if (missingPunchesRes.success && Array.isArray(missingPunchesRes.data) && missingPunchesRes.data.length > 0) {
           const pStmts = missingPunchesRes.data.map(p => ({
             sql: `INSERT INTO raw_punches (staff_no, date, weekday, swipe_record, machine_work_time, batch_id)
                   VALUES (?, ?, ?, ?, ?, ?)
-                  ON CONFLICT(staff_no, date) DO UPDATE SET swipe_record = excluded.swipe_record, machine_work_time = excluded.machine_work_time`,
+                  ON CONFLICT(staff_no, date) DO UPDATE SET
+                    swipe_record = excluded.swipe_record,
+                    machine_work_time = excluded.machine_work_time,
+                    batch_id = COALESCE(excluded.batch_id, raw_punches.batch_id)`,
             args: [p.staff_no, p.date, p.weekday || '', p.swipe_record || '', p.machine_work_time || '', p.batch_id || '']
           }));
           for (let i = 0; i < pStmts.length; i += 150) {
@@ -586,8 +577,8 @@ async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
           sql: `INSERT INTO daily_attendance (
                   staff_no, date, weekday, raw_swipes, original_raw_swipes, manual_punches,
                   effective_in, effective_out, regular_hours, ot_hours, sunday_ot_hours, total_hours,
-                  late_minutes, status, shift, is_manual_override, override_reason
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  late_minutes, status, shift, is_manual_override, override_reason, forfeiture_reason
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(staff_no, date) DO UPDATE SET
                   raw_swipes = excluded.raw_swipes,
                   original_raw_swipes = excluded.original_raw_swipes,
@@ -602,14 +593,15 @@ async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
                   status = excluded.status,
                   shift = excluded.shift,
                   is_manual_override = 1,
-                  override_reason = excluded.override_reason`,
+                  override_reason = excluded.override_reason,
+                  forfeiture_reason = excluded.forfeiture_reason`,
           args: [
             r.staff_no || '', r.date || '', r.weekday || '', r.raw_swipes || '',
             r.original_raw_swipes || '', r.manual_punches || '',
             r.effective_in || '', r.effective_out || '', r.regular_hours || 0,
             r.ot_hours || 0, r.sunday_ot_hours || 0, r.total_hours || 0,
             r.late_minutes || 0, r.status || 'Absent', r.shift || '08:00',
-            1, r.override_reason || ''
+            1, r.override_reason || '', r.forfeiture_reason || ''
           ]
         }));
         for (let i = 0; i < overrideStmts.length; i += 150) {
@@ -621,63 +613,76 @@ async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
       console.warn('Manual overrides cloud hydration warning:', oErr.message);
     }
 
-    // 6b. Hydrate New Date Ranges or Missing Full Attendance from Supabase
-    const cloudCountRes = await queryCloud('SELECT count(*) as cnt, max(date) as max_date FROM daily_attendance;', 5000);
-    if (cloudCountRes.success && cloudCountRes.data && cloudCountRes.data[0]) {
-      const cloudCount = parseInt(cloudCountRes.data[0].cnt || 0, 10);
-      const cloudMaxDate = cloudCountRes.data[0].max_date || '';
+    // 6b. Month-by-Month Bidirectional Sync of Daily Attendance
+    try {
+      const cloudMonthsRes = await queryCloud("SELECT DISTINCT SUBSTR(date, 1, 7) as m, count(*) as cnt FROM daily_attendance GROUP BY SUBSTR(date, 1, 7);", 5000);
+      const localMonthsRes = await executeLocal("SELECT DISTINCT SUBSTR(date, 1, 7) as m, count(*) as cnt FROM daily_attendance GROUP BY SUBSTR(date, 1, 7);");
+      const localMonthMap = {};
+      (localMonthsRes.rows || []).forEach(r => { localMonthMap[r.m] = parseInt(r.cnt, 10); });
 
-      const localCountRes = await executeLocal('SELECT count(*) as cnt, max(date) as max_date FROM daily_attendance');
-      const localCount = parseInt(localCountRes.rows[0]?.cnt || 0, 10);
-      const localMaxDate = localCountRes.rows[0]?.max_date || '';
+      if (cloudMonthsRes.success && Array.isArray(cloudMonthsRes.data)) {
+        for (const cm of cloudMonthsRes.data) {
+          const mKey = cm.m;
+          if (!mKey) continue;
+          const cCnt = parseInt(cm.cnt, 10);
+          const lCnt = localMonthMap[mKey] || 0;
+          if (cCnt > lCnt || lCnt === 0) {
+            console.log(`📥 Ingesting month ${mKey} attendance records from Supabase Cloud (Cloud: ${cCnt}, Local: ${lCnt})...`);
+            const mRes = await queryCloud(`SELECT * FROM daily_attendance WHERE date LIKE '${mKey}%';`, 25000);
+            if (mRes.success && Array.isArray(mRes.data) && mRes.data.length > 0) {
+              const stmts = mRes.data.map(r => ({
+                sql: `INSERT INTO daily_attendance (
+                        staff_no, date, weekday, raw_swipes, original_raw_swipes, manual_punches,
+                        effective_in, effective_out, regular_hours, ot_hours, sunday_ot_hours, total_hours,
+                        late_minutes, status, shift, is_manual_override, override_reason, forfeiture_reason
+                      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      ON CONFLICT(staff_no, date) DO UPDATE SET
+                        raw_swipes = excluded.raw_swipes,
+                        original_raw_swipes = excluded.original_raw_swipes,
+                        manual_punches = excluded.manual_punches,
+                        effective_in = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.effective_in ELSE excluded.effective_in END,
+                        effective_out = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.effective_out ELSE excluded.effective_out END,
+                        regular_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.regular_hours ELSE excluded.regular_hours END,
+                        ot_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.ot_hours ELSE excluded.ot_hours END,
+                        sunday_ot_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.sunday_ot_hours ELSE excluded.sunday_ot_hours END,
+                        total_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.total_hours ELSE excluded.total_hours END,
+                        late_minutes = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.late_minutes ELSE excluded.late_minutes END,
+                        status = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.status ELSE excluded.status END,
+                        shift = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.shift ELSE excluded.shift END,
+                        is_manual_override = CASE WHEN excluded.is_manual_override = 1 THEN 1 ELSE daily_attendance.is_manual_override END,
+                        override_reason = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.override_reason ELSE excluded.override_reason END,
+                        forfeiture_reason = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.forfeiture_reason ELSE excluded.forfeiture_reason END`,
+                args: [
+                  r.staff_no || '', r.date || '', r.weekday || '', r.raw_swipes || '',
+                  r.original_raw_swipes || '', r.manual_punches || '',
+                  r.effective_in || '', r.effective_out || '', r.regular_hours || 0,
+                  r.ot_hours || 0, r.sunday_ot_hours || 0, r.total_hours || 0,
+                  r.late_minutes || 0, r.status || 'Absent', r.shift || '08:00',
+                  r.is_manual_override ? 1 : 0, r.override_reason || '', r.forfeiture_reason || ''
+                ]
+              }));
+              for (let i = 0; i < stmts.length; i += 150) {
+                await batchLocal(stmts.slice(i, i + 150));
+              }
+            }
+          }
+        }
 
-      console.log(`📡 Supabase Cloud Attendance: Local = ${localCount} (Max: ${localMaxDate}) | Cloud = ${cloudCount} (Max: ${cloudMaxDate})`);
-
-      if (cloudCount > localCount || localCount === 0) {
-        console.log(`🛡️ Self-Healing Recovery: Ingesting delta records from Supabase Cloud...`);
-        const missingQuery = localCount === 0
-          ? `SELECT * FROM daily_attendance;`
-          : `SELECT * FROM daily_attendance WHERE date > ${escapeSqlVal(localMaxDate)};`;
-
-        const missingRes = await queryCloud(missingQuery, 20000);
-        if (missingRes.success && Array.isArray(missingRes.data) && missingRes.data.length > 0) {
-          console.log(`📥 Ingesting ${missingRes.data.length} cloud attendance records into local SQLite...`);
-          const stmts = missingRes.data.map(r => ({
-            sql: `INSERT INTO daily_attendance (
-                    staff_no, date, weekday, raw_swipes, original_raw_swipes, manual_punches,
-                    effective_in, effective_out, regular_hours, ot_hours, sunday_ot_hours, total_hours,
-                    late_minutes, status, shift, is_manual_override, override_reason
-                  ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                  ON CONFLICT(staff_no, date) DO UPDATE SET
-                    raw_swipes = excluded.raw_swipes,
-                    original_raw_swipes = excluded.original_raw_swipes,
-                    manual_punches = excluded.manual_punches,
-                    effective_in = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.effective_in ELSE excluded.effective_in END,
-                    effective_out = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.effective_out ELSE excluded.effective_out END,
-                    regular_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.regular_hours ELSE excluded.regular_hours END,
-                    ot_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.ot_hours ELSE excluded.ot_hours END,
-                    sunday_ot_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.sunday_ot_hours ELSE excluded.sunday_ot_hours END,
-                    total_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.total_hours ELSE excluded.total_hours END,
-                    late_minutes = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.late_minutes ELSE excluded.late_minutes END,
-                    status = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.status ELSE excluded.status END,
-                    shift = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.shift ELSE excluded.shift END,
-                    is_manual_override = GREATEST(COALESCE(daily_attendance.is_manual_override, 0), COALESCE(excluded.is_manual_override, 0)),
-                    override_reason = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.override_reason ELSE excluded.override_reason END`,
-            args: [
-              r.staff_no || '', r.date || '', r.weekday || '', r.raw_swipes || '',
-              r.original_raw_swipes || '', r.manual_punches || '',
-              r.effective_in || '', r.effective_out || '', r.regular_hours || 0,
-              r.ot_hours || 0, r.sunday_ot_hours || 0, r.total_hours || 0,
-              r.late_minutes || 0, r.status || 'Absent', r.shift || '08:00',
-              r.is_manual_override ? 1 : 0, r.override_reason || ''
-            ]
-          }));
-
-          for (let i = 0; i < stmts.length; i += 150) {
-            await batchLocal(stmts.slice(i, i + 150));
+        // Push any months that local has more records for up to Cloud
+        for (const [mKey, lCnt] of Object.entries(localMonthMap)) {
+          if (!mKey) continue;
+          const cCnt = parseInt(cloudMonthsRes.data.find(c => c.m === mKey)?.cnt || 0, 10);
+          if (lCnt > cCnt) {
+            console.log(`☁️ Syncing month ${mKey} from local to Supabase Cloud (Local: ${lCnt}, Cloud: ${cCnt})...`);
+            const localMonthRecs = await executeLocal(`SELECT * FROM daily_attendance WHERE date LIKE '${mKey}%';`);
+            if (localMonthRecs.rows && localMonthRecs.rows.length > 0) {
+              await syncAttendanceToCloud(localMonthRecs.rows);
+            }
           }
         }
       }
+    } catch (mErr) {
+      console.warn('Monthly attendance hydration warning:', mErr.message);
     }
 
     // 7. Hydrate Audit Logs from Supabase
@@ -709,6 +714,8 @@ async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
 
 module.exports = {
   queryCloud,
+  executeCloudWithRetry,
+  calibrateCloudSequences,
   isCloudAvailable,
   getCloudStatus,
   syncAttendanceToCloud,

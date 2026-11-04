@@ -1243,19 +1243,28 @@ async function recomputeAllAttendance() {
 
     for (const d of finalProcessed) {
       await execute(
-        `UPDATE daily_attendance SET
-           effective_in = CASE WHEN is_manual_override = 1 THEN effective_in ELSE ? END,
-           effective_out = CASE WHEN is_manual_override = 1 THEN effective_out ELSE ? END,
-           regular_hours = CASE WHEN is_manual_override = 1 THEN regular_hours ELSE ? END,
-           ot_hours = CASE WHEN is_manual_override = 1 THEN ot_hours ELSE ? END,
-           sunday_ot_hours = CASE WHEN is_manual_override = 1 THEN sunday_ot_hours ELSE ? END,
-           total_hours = CASE WHEN is_manual_override = 1 THEN total_hours ELSE ? END,
-           late_minutes = CASE WHEN is_manual_override = 1 THEN late_minutes ELSE ? END,
-           shift = CASE WHEN is_manual_override = 1 THEN shift ELSE ? END,
-           status = CASE WHEN is_manual_override = 1 THEN status ELSE ? END,
-           forfeiture_reason = CASE WHEN is_manual_override = 1 THEN forfeiture_reason ELSE ? END
-         WHERE staff_no = ? AND date = ?`,
+        `INSERT INTO daily_attendance (
+           staff_no, date, weekday, raw_swipes, original_raw_swipes, manual_punches,
+           effective_in, effective_out, regular_hours, ot_hours, sunday_ot_hours, total_hours,
+           late_minutes, status, shift, is_manual_override, override_reason, forfeiture_reason
+         ) VALUES (?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, '', ?)
+         ON CONFLICT(staff_no, date) DO UPDATE SET
+           effective_in = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.effective_in ELSE excluded.effective_in END,
+           effective_out = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.effective_out ELSE excluded.effective_out END,
+           regular_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.regular_hours ELSE excluded.regular_hours END,
+           ot_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.ot_hours ELSE excluded.ot_hours END,
+           sunday_ot_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.sunday_ot_hours ELSE excluded.sunday_ot_hours END,
+           total_hours = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.total_hours ELSE excluded.total_hours END,
+           late_minutes = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.late_minutes ELSE excluded.late_minutes END,
+           shift = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.shift ELSE excluded.shift END,
+           status = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.status ELSE excluded.status END,
+           forfeiture_reason = CASE WHEN daily_attendance.is_manual_override = 1 THEN daily_attendance.forfeiture_reason ELSE excluded.forfeiture_reason END`,
         [
+          d.staff_no,
+          d.date,
+          d.weekday || '',
+          d.raw_swipes || '',
+          d.original_raw_swipes || d.raw_swipes || '',
           d.effectiveIn || d.effective_in || '',
           d.effectiveOut || d.effective_out || '',
           d.regularHours || d.regular_hours || 0,
@@ -1263,11 +1272,9 @@ async function recomputeAllAttendance() {
           d.sundayOtHours || d.sunday_ot_hours || 0,
           d.totalHours || d.total_hours || 0,
           d.lateMinutes || d.late_minutes || 0,
-          d.shift || '08:00',
           d.status || 'Absent',
-          d.forfeiture_reason || d.forfeitureReason || '',
-          d.staff_no,
-          d.date
+          d.shift || '08:00',
+          d.forfeiture_reason || d.forfeitureReason || ''
         ]
       );
     }
@@ -2071,13 +2078,32 @@ app.post('/api/attendance/edit', async (req, res) => {
     const manualPunchesStr = addedTokens.join(' ');
     const finalOrigSwipes = oldRec.original_raw_swipes || oldRec.raw_swipes || effectiveSwipes;
 
-    // Update Daily Attendance
+    // Upsert Daily Attendance (guarantees record exists even if not previously in daily_attendance)
     await execute(
-      `UPDATE daily_attendance SET
-         raw_swipes = ?, original_raw_swipes = ?, effective_in = ?, effective_out = ?, regular_hours = ?, ot_hours = ?, sunday_ot_hours = ?, total_hours = ?,
-         late_minutes = ?, status = ?, shift = ?, is_manual_override = 1, override_reason = ?, manual_punches = ?
-       WHERE staff_no = ? AND date = ?`,
+      `INSERT INTO daily_attendance (
+         staff_no, date, weekday, raw_swipes, original_raw_swipes, effective_in, effective_out,
+         regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift,
+         is_manual_override, override_reason, manual_punches
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+       ON CONFLICT(staff_no, date) DO UPDATE SET
+         raw_swipes = excluded.raw_swipes,
+         original_raw_swipes = excluded.original_raw_swipes,
+         effective_in = excluded.effective_in,
+         effective_out = excluded.effective_out,
+         regular_hours = excluded.regular_hours,
+         ot_hours = excluded.ot_hours,
+         sunday_ot_hours = excluded.sunday_ot_hours,
+         total_hours = excluded.total_hours,
+         late_minutes = excluded.late_minutes,
+         status = excluded.status,
+         shift = excluded.shift,
+         is_manual_override = 1,
+         override_reason = excluded.override_reason,
+         manual_punches = excluded.manual_punches`,
       [
+        staff_no,
+        date,
+        oldRec.weekday || computed.weekday || '',
         effectiveSwipes,
         finalOrigSwipes,
         effectiveIn,
@@ -2091,8 +2117,6 @@ app.post('/api/attendance/edit', async (req, res) => {
         computed.shift || '08:00',
         reason || 'Manual correction',
         manualPunchesStr,
-        staff_no,
-        date,
       ]
     );
 
@@ -2338,11 +2362,30 @@ app.post('/api/attendance/bulk-edit', async (req, res) => {
       const finalOrigSwipes = oldRec.original_raw_swipes || oldRec.raw_swipes || effectiveSwipes;
 
       await execute(
-        `UPDATE daily_attendance SET
-           raw_swipes = ?, original_raw_swipes = ?, effective_in = ?, effective_out = ?, regular_hours = ?, ot_hours = ?, sunday_ot_hours = ?, total_hours = ?,
-           late_minutes = ?, status = ?, shift = ?, is_manual_override = 1, override_reason = ?, manual_punches = ?
-         WHERE staff_no = ? AND date = ?`,
+        `INSERT INTO daily_attendance (
+           staff_no, date, weekday, raw_swipes, original_raw_swipes, effective_in, effective_out,
+           regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift,
+           is_manual_override, override_reason, manual_punches
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+         ON CONFLICT(staff_no, date) DO UPDATE SET
+           raw_swipes = excluded.raw_swipes,
+           original_raw_swipes = excluded.original_raw_swipes,
+           effective_in = excluded.effective_in,
+           effective_out = excluded.effective_out,
+           regular_hours = excluded.regular_hours,
+           ot_hours = excluded.ot_hours,
+           sunday_ot_hours = excluded.sunday_ot_hours,
+           total_hours = excluded.total_hours,
+           late_minutes = excluded.late_minutes,
+           status = excluded.status,
+           shift = excluded.shift,
+           is_manual_override = 1,
+           override_reason = excluded.override_reason,
+           manual_punches = excluded.manual_punches`,
         [
+          staff_no,
+          date,
+          oldRec.weekday || computed.weekday || '',
           effectiveSwipes,
           finalOrigSwipes,
           effectiveIn,
@@ -2356,8 +2399,6 @@ app.post('/api/attendance/bulk-edit', async (req, res) => {
           computed.shift || '08:00',
           item.reason || reason || 'Fast-Fix Resolution',
           manualPunchesStr,
-          staff_no,
-          date,
         ]
       );
 
