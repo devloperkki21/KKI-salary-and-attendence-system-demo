@@ -302,6 +302,15 @@ async function initDatabase() {
   // Calibrate sequences so next inserts don't collide
   await calibrateSequences();
 
+  // Ensure schema migrations are up-to-date
+  try {
+    const schema = DB_SCHEMA || 'public';
+    await querySupabaseDirect(`ALTER TABLE "${schema}".daily_attendance ADD COLUMN IF NOT EXISTS forfeiture_reason TEXT DEFAULT '';`);
+    await querySupabaseDirect(`ALTER TABLE "${schema}".daily_attendance ADD COLUMN IF NOT EXISTS override_reason TEXT DEFAULT '';`);
+  } catch (e) {
+    console.warn('Schema migration warning:', e.message);
+  }
+
   // Synchronize environment variable credentials into settings table
   try {
     const creds = [
