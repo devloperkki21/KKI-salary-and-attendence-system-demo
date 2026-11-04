@@ -7,8 +7,8 @@ const ISSUER_NAME = 'KKI Attendance & Payroll';
 const ACCOUNT_LABEL = 'Admin';
 const SESSION_COOKIE_NAME = 'kki_session';
 
-// Permanent stable Base32 Secret & Emergency Backup Codes (Protects against Render ephemeral wipes)
-const DEFAULT_PERMANENT_TOTP_SECRET = 'SLFRTE6JFYKYRJV3NFPSEN7576NKOHAF';
+// Permanent stable Base32 Secret & Emergency Backup Codes (Configured via Render Environment Variables)
+const DEFAULT_PERMANENT_TOTP_SECRET = process.env.TOTP_SECRET || 'SLFRTE6JFYKYRJV3NFPSEN7576NKOHAF';
 const DEFAULT_BACKUP_CODES = [
   '1942-8371',
   '5820-4916',
@@ -35,9 +35,9 @@ async function getAuthConfig() {
     `SELECT key, value FROM settings WHERE key IN ('master_password', 'payroll_password', 'totp_enabled', 'totp_secret', 'emergency_backup_codes')`
   );
   const cfg = {
-    master_password: 'kki123',
+    master_password: process.env.MASTER_PASSWORD || 'kki123',
     totp_enabled: true,
-    totp_secret: DEFAULT_PERMANENT_TOTP_SECRET,
+    totp_secret: process.env.TOTP_SECRET || DEFAULT_PERMANENT_TOTP_SECRET,
     emergency_backup_codes: []
   };
 
