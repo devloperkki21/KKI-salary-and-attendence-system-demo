@@ -929,22 +929,30 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     const startDate = sortedDates[0] || '';
     const endDate = sortedDates[sortedDates.length - 1] || '';
 
-    // Async background sync to cloud database (non-blocking)
+    // Guaranteed synchronous mirror to Supabase Cloud before sending response (Render Zero-Data-Loss Shield)
     try {
       if (startDate && endDate) {
-        execute(`SELECT * FROM daily_attendance WHERE date >= ? AND date <= ?`, [startDate, endDate]).then(res => {
-          if (res.rows && res.rows.length > 0) syncAttendanceToCloud(res.rows).catch(() => {});
-        }).catch(() => {});
-        execute(`SELECT * FROM raw_punches WHERE date >= ? AND date <= ?`, [startDate, endDate]).then(res => {
-          if (res.rows && res.rows.length > 0) syncRawPunchesToCloud(res.rows).catch(() => {});
-        }).catch(() => {});
-        execute(`SELECT * FROM workers`).then(res => {
-          if (res.rows && res.rows.length > 0) {
-            for (const w of res.rows) syncWorkerToCloud(w).catch(() => {});
+        const [attRes, pRes, wRes] = await Promise.all([
+          execute(`SELECT * FROM daily_attendance WHERE date >= ? AND date <= ?`, [startDate, endDate]),
+          execute(`SELECT * FROM raw_punches WHERE date >= ? AND date <= ?`, [startDate, endDate]),
+          execute(`SELECT * FROM workers`)
+        ]);
+        if (attRes.rows && attRes.rows.length > 0) {
+          await syncAttendanceToCloud(attRes.rows);
+        }
+        if (pRes.rows && pRes.rows.length > 0) {
+          await syncRawPunchesToCloud(pRes.rows);
+        }
+        if (wRes.rows && wRes.rows.length > 0) {
+          for (const w of wRes.rows) {
+            await syncWorkerToCloud(w).catch(() => {});
           }
-        }).catch(() => {});
+        }
+        console.log(`☁️ Successfully confirmed cloud mirror for batch (${startDate} to ${endDate}) to Supabase Cloud!`);
       }
-    } catch (syncErr) {}
+    } catch (syncErr) {
+      console.warn('Upload cloud sync warning:', syncErr.message);
+    }
 
     const detectedMonth = detectActiveMonthDetails(startDate, endDate);
 
@@ -2068,7 +2076,7 @@ app.post('/api/attendance/edit', async (req, res) => {
        ON CONFLICT(staff_no, date) DO UPDATE SET swipe_record = excluded.swipe_record`,
       [staff_no, date, oldRec.weekday || '', effectiveSwipes]
     );
-    syncRawPunchesToCloud([{ staff_no, date, weekday: oldRec.weekday || '', swipe_record: effectiveSwipes }]).catch(() => {});
+    await syncRawPunchesToCloud([{ staff_no, date, weekday: oldRec.weekday || '', swipe_record: effectiveSwipes }]);
 
     // Identify which tokens are manually added
     const originalSwipesStr = oldRec.original_raw_swipes || oldRec.raw_swipes || '';

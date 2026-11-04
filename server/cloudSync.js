@@ -536,6 +536,61 @@ async function selfHealFromCloud(executeLocal, batchLocal, backupDbToSeed) {
       console.warn('Calendar cloud hydration warning:', cErr.message);
     }
 
+    // 4b. Hydrate Paid Holidays from Supabase
+    try {
+      const holRes = await queryCloud('SELECT holiday_date, holiday_name, is_recurring FROM paid_holidays;', 4000);
+      if (holRes.success && Array.isArray(holRes.data) && holRes.data.length > 0) {
+        for (const h of holRes.data) {
+          await executeLocal(
+            `INSERT INTO paid_holidays (holiday_date, holiday_name, is_recurring)
+             VALUES (?, ?, ?)
+             ON CONFLICT(holiday_date) DO UPDATE SET holiday_name = excluded.holiday_name, is_recurring = excluded.is_recurring`,
+            [h.holiday_date, h.holiday_name || '', h.is_recurring ? 1 : 0]
+          );
+        }
+      }
+    } catch (hErr) {
+      console.warn('Paid holidays cloud hydration warning:', hErr.message);
+    }
+
+    // 4c. Hydrate Custom Rules from Supabase
+    try {
+      const crRes = await queryCloud('SELECT rule_name, rule_type, target_staff_no, exemption_type, start_time, end_time, threshold_mins, deduction_mins, deduction_amount, valid_from, valid_to, max_allowed_days, grace_allowed_mins, is_active FROM custom_rules;', 5000);
+      if (crRes.success && Array.isArray(crRes.data) && crRes.data.length > 0) {
+        const localCr = await executeLocal('SELECT count(*) as cnt FROM custom_rules');
+        if (parseInt(localCr.rows[0]?.cnt || 0, 10) < crRes.data.length) {
+          for (const r of crRes.data) {
+            await executeLocal(
+              `INSERT OR IGNORE INTO custom_rules (rule_name, rule_type, target_staff_no, exemption_type, start_time, end_time, threshold_mins, deduction_mins, deduction_amount, valid_from, valid_to, max_allowed_days, grace_allowed_mins, is_active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [r.rule_name, r.rule_type, r.target_staff_no || 'all', r.exemption_type || '', r.start_time || '', r.end_time || '', r.threshold_mins || 0, r.deduction_mins || 0, r.deduction_amount || 0, r.valid_from || '', r.valid_to || '', r.max_allowed_days || 0, r.grace_allowed_mins || 30, r.is_active !== undefined ? (r.is_active ? 1 : 0) : 1]
+            );
+          }
+        }
+      }
+    } catch (crErr) {
+      console.warn('Custom rules cloud hydration warning:', crErr.message);
+    }
+
+    // 4d. Hydrate Custom Salary Rules from Supabase
+    try {
+      const csrRes = await queryCloud('SELECT rule_name, rule_type, target_staff_no, condition_type, condition_value, action_type, action_value, applies_to_day, description, source, ai_original_prompt, is_active FROM custom_salary_rules;', 5000);
+      if (csrRes.success && Array.isArray(csrRes.data) && csrRes.data.length > 0) {
+        const localCsr = await executeLocal('SELECT count(*) as cnt FROM custom_salary_rules');
+        if (parseInt(localCsr.rows[0]?.cnt || 0, 10) < csrRes.data.length) {
+          for (const r of csrRes.data) {
+            await executeLocal(
+              `INSERT OR IGNORE INTO custom_salary_rules (rule_name, rule_type, target_staff_no, condition_type, condition_value, action_type, action_value, applies_to_day, description, source, ai_original_prompt, is_active)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              [r.rule_name, r.rule_type, r.target_staff_no || 'all', r.condition_type || 'always', r.condition_value || '0', r.action_type || 'add_fixed', r.action_value || 0, r.applies_to_day || 'all', r.description || '', r.source || 'manual', r.ai_original_prompt || '', r.is_active !== undefined ? (r.is_active ? 1 : 0) : 1]
+            );
+          }
+        }
+      }
+    } catch (csrErr) {
+      console.warn('Custom salary rules cloud hydration warning:', csrErr.message);
+    }
+
     // 5. Hydrate Raw Punches from Supabase (Full coverage without skipping prior dates)
     try {
       const cloudPunchCountRes = await queryCloud('SELECT count(*) as cnt, max(date) as max_date FROM raw_punches;', 5000);
