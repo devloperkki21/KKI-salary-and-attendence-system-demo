@@ -9,6 +9,7 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || proce
 const SUPABASE_ACCESS_TOKEN = process.env.SUPABASE_ACCESS_TOKEN || Buffer.from('c2JwX2ZjOTJkMzEyMDMzNDNhYzM0ZGY5ZWQ3MjhlOGY1N2I2N2YyODVlMDI=', 'base64').toString('utf-8');
 const SUPABASE_PROJECT_REF = process.env.SUPABASE_PROJECT_REF || 'drladbxpfnapxjmoxqhj';
 const DATABASE_URL = process.env.DATABASE_URL || process.env.SUPABASE_DB_URL || null;
+const DB_SCHEMA = process.env.DB_SCHEMA || 'public';
 
 // Credentials from environment variables (No hardcoded credentials)
 const PAYROLL_PASSWORD = process.env.PAYROLL_PASSWORD || 'kki123';
@@ -114,10 +115,12 @@ function normalizeSql(sql) {
  * Execute raw PostgreSQL query on Supabase
  */
 function querySupabaseDirect(sql, timeoutMs = 25000) {
+  const schemaPrefix = DB_SCHEMA && DB_SCHEMA !== 'public' ? `SET search_path TO "${DB_SCHEMA}", public;\n` : '';
+
   // If pgPool is active, query via pool
   if (pgPool) {
     return new Promise((resolve, reject) => {
-      pgPool.query(sql, (err, res) => {
+      pgPool.query(schemaPrefix + sql, (err, res) => {
         if (err) return reject(err);
         resolve(res.rows || []);
       });
@@ -126,7 +129,7 @@ function querySupabaseDirect(sql, timeoutMs = 25000) {
 
   // Otherwise query via Supabase Database Management API (HTTPS direct to PostgreSQL)
   return new Promise((resolve, reject) => {
-    const postData = JSON.stringify({ query: sql });
+    const postData = JSON.stringify({ query: schemaPrefix + sql });
     const options = {
       hostname: 'api.supabase.com',
       port: 443,
@@ -259,9 +262,12 @@ async function calibrateSequences() {
 
   for (const t of seqTables) {
     try {
-      await querySupabaseDirect(`SELECT setval('${t.seq}', (SELECT COALESCE(MAX(id), 0) + 1 FROM "${t.tbl}"), false);`);
+      const schema = DB_SCHEMA || 'public';
+      await querySupabaseDirect(`SELECT setval('${schema}."${t.seq}"', (SELECT COALESCE(MAX(id), 0) + 1 FROM "${schema}"."${t.tbl}"), false);`);
     } catch (e) {
-      // Sequence might already be aligned or have different name
+      try {
+        await querySupabaseDirect(`SELECT setval('${t.seq}', (SELECT COALESCE(MAX(id), 0) + 1 FROM "${t.tbl}"), false);`);
+      } catch (err2) {}
     }
   }
 }
@@ -320,7 +326,7 @@ async function initDatabase() {
   try {
     const wRes = await execute('SELECT COUNT(*) as cnt FROM workers;');
     const aRes = await execute('SELECT COUNT(*) as cnt FROM daily_attendance;');
-    console.log(`📊 Supabase Live Status: ${wRes.rows[0]?.cnt || 0} Workers, ${aRes.rows[0]?.cnt || 0} Daily Attendance Records.`);
+    console.log(`📊 Supabase Live Status [Schema: ${DB_SCHEMA}]: ${wRes.rows[0]?.cnt || 0} Workers, ${aRes.rows[0]?.cnt || 0} Daily Attendance Records.`);
   } catch (e) {}
 
   console.log('✅ Supabase Primary Database Ready. Local SQLite storage eliminated.');

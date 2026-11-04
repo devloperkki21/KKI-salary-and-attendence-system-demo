@@ -2,6 +2,7 @@ require('dotenv').config();
 const { execute } = require('./db');
 
 const PROJECT_REF = process.env.SUPABASE_PROJECT_REF || 'drladbxpfnapxjmoxqhj';
+const DB_SCHEMA = process.env.DB_SCHEMA || 'public';
 
 /**
  * Direct cloud query wrapper delegating to primary Supabase database execution
@@ -80,7 +81,8 @@ async function getCloudStatus() {
     }
     return {
       connected: true,
-      provider: 'Supabase Cloud (PostgreSQL 17.6 Primary Database)',
+      provider: `Supabase Cloud (PostgreSQL 17.6 - Schema: ${DB_SCHEMA})`,
+      schema: DB_SCHEMA,
       projectRef: PROJECT_REF,
       counts
     };
