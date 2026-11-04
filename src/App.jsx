@@ -643,6 +643,7 @@ export default function App() {
             availableMonths={availableMonths}
             onSelectMonth={handleSelectMonth}
             onRefreshData={refreshData}
+            loading={loading}
           />
         )}
 
