@@ -78,6 +78,17 @@ export default function FactoryCalendarModal({
     fetchCalendar();
   }, [isOpen, currentYear, currentMonth]);
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen, onClose]);
+
   // Calendar Grid Calculation
   const calendarGrid = useMemo(() => {
     const firstDayIndex = new Date(currentYear, currentMonth, 1).getDay(); // 0 = Sunday, 1 = Monday...
@@ -280,9 +291,16 @@ export default function FactoryCalendarModal({
 
   const monthName = new Date(currentYear, currentMonth, 1).toLocaleString('default', { month: 'long' });
 
+  if (!isOpen) return null;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/85 backdrop-blur-md animate-in fade-in">
-      <div className="glass-modal w-full max-w-5xl max-h-[92vh] flex flex-col rounded-3xl p-5 sm:p-6 shadow-2xl border-2 border-indigo-500/40 bg-slate-900 text-slate-100 overflow-hidden">
+    <div 
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/85 backdrop-blur-md animate-in fade-in"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+    >
+      <div className="glass-modal w-full max-w-5xl max-h-[92vh] flex flex-col rounded-3xl p-5 sm:p-6 shadow-2xl border-2 border-indigo-500/40 bg-slate-900 text-slate-100 overflow-hidden" onClick={(e) => e.stopPropagation()}>
         
         {/* Modal Header */}
         <div className="flex items-center justify-between border-b-2 border-slate-800 pb-4 mb-4 shrink-0">
@@ -306,7 +324,12 @@ export default function FactoryCalendarModal({
           </div>
 
           <button 
-            onClick={onClose}
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onClose();
+            }}
             className="text-slate-400 hover:text-white p-2 rounded-xl hover:bg-slate-800 transition-all cursor-pointer"
             title="Close"
           >

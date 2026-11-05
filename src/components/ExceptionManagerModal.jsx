@@ -164,9 +164,16 @@ export default function ExceptionManagerModal({
     }
   };
 
+  if (!isOpen) return null;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/85 backdrop-blur-md animate-in fade-in">
-      <div className="glass-modal w-full max-w-5xl max-h-[92vh] rounded-3xl p-5 sm:p-7 shadow-2xl border-2 border-amber-500/60 flex flex-col space-y-4 overflow-hidden bg-slate-900 text-slate-100">
+    <div 
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/85 backdrop-blur-md animate-in fade-in"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) handleCloseModal();
+      }}
+    >
+      <div className="glass-modal w-full max-w-5xl max-h-[92vh] rounded-3xl p-5 sm:p-7 shadow-2xl border-2 border-amber-500/60 flex flex-col space-y-4 overflow-hidden bg-slate-900 text-slate-100" onClick={(e) => e.stopPropagation()}>
 
         {/* Modal Top Header */}
         <div className="flex items-start justify-between border-b-2 border-slate-700/80 pb-4">

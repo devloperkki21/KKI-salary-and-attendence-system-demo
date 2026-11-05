@@ -785,8 +785,9 @@ export default function App() {
       </main>
 
       {/* MODAL: INCOMPLETE RECORDS FAST-FIX MANAGER */}
-      <IncompleteManagerModal
-        isOpen={showIncompleteModal}
+      {showIncompleteModal && (
+        <IncompleteManagerModal
+          isOpen={showIncompleteModal}
         workers={workers}
         allAttendance={allAttendance}
         selectedMonth={selectedMonth}
@@ -797,18 +798,21 @@ export default function App() {
         }}
         onRefreshData={() => refreshData(selectedMonth)}
         initialStaffNo={incompleteStaffFilter}
-      />
+        />
+      )}
 
       {/* MODAL: FACTORY CALENDAR & SHIFT OVERRIDES MANAGER */}
-      <FactoryCalendarModal
-        isOpen={showCalendarModal}
+      {showCalendarModal && (
+        <FactoryCalendarModal
+          isOpen={showCalendarModal}
         initialMonth={selectedMonth && selectedMonth !== 'all' ? selectedMonth : ''}
         onClose={() => {
           setShowCalendarModal(false);
           refreshData(selectedMonth);
         }}
         onRefreshData={() => refreshData(selectedMonth)}
-      />
+        />
+      )}
 
       {/* MODAL: UNLOCK PAYROLL & SALARY MODE */}
       {showUnlockModal && (

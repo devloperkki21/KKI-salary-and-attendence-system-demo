@@ -538,9 +538,27 @@ export default function IncompleteManagerModal({
     onClose();
   };
 
+  useEffect(() => {
+    if (!isOpen) return;
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        handleCloseAndSync();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isOpen]);
+
+  if (!isOpen) return null;
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-950/85 backdrop-blur-md animate-in fade-in">
-      <div className="glass-modal w-full max-w-7xl max-h-[94vh] flex flex-col rounded-3xl p-5 sm:p-6 shadow-2xl border-2 border-amber-500/50 bg-slate-900 overflow-hidden">
+    <div 
+      className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-950/85 backdrop-blur-md animate-in fade-in"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) handleCloseAndSync();
+      }}
+    >
+      <div className="glass-modal w-full max-w-7xl max-h-[94vh] flex flex-col rounded-3xl p-5 sm:p-6 shadow-2xl border-2 border-amber-500/50 bg-slate-900 overflow-hidden" onClick={(e) => e.stopPropagation()}>
 
         {/* Header Bar */}
         <div className="flex items-center justify-between border-b-2 border-slate-800 pb-4 mb-3.5 shrink-0">
@@ -630,7 +648,12 @@ export default function IncompleteManagerModal({
           </div>
 
           <button
-            onClick={handleCloseAndSync}
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              handleCloseAndSync();
+            }}
             className="text-slate-400 hover:text-white p-2 rounded-xl hover:bg-slate-800 transition-all cursor-pointer"
             title="Close modal and refresh parent data"
           >
