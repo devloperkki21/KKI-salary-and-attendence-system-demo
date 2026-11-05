@@ -3,12 +3,12 @@ import { Edit3, CheckCircle, X, AlertTriangle, Loader2 } from 'lucide-react';
 import { normalizeTimeInput } from '../utils/formatters';
 
 export default function EditModal({ record, staffNo, onSave, onCancel, loading }) {
-  if (!record) return null;
-
-  const [rawSwipes, setRawSwipes] = useState(record.raw_swipes || '');
-  const [status, setStatus] = useState(record.status || 'Present (Full)');
+  const [rawSwipes, setRawSwipes] = useState(record?.raw_swipes || '');
+  const [status, setStatus] = useState(record?.status || 'Present (Full)');
   const [reason, setReason] = useState('');
   const [error, setError] = useState('');
+
+  if (!record) return null;
 
   const handleSubmit = (e) => {
     e.preventDefault();

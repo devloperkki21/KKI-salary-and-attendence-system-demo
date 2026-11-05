@@ -36,8 +36,6 @@ export default function ExceptionManagerModal({
   onRefreshData,
   onOpenIncompleteManager
 }) {
-  if (!isOpen) return null;
-
   const [searchTerm, setSearchTerm] = useState('');
   const [filterTab, setFilterTab] = useState('all'); // 'all' | 'exception' | 'standard'
   const [selectedStaffNos, setSelectedStaffNos] = useState(new Set());

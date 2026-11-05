@@ -38,7 +38,6 @@ export default function IncompleteManagerModal({
   selectedMonth = 'all',
   availableMonths = []
 }) {
-  if (!isOpen) return null;
 
   const [modalMonth, setModalMonth] = useState(selectedMonth || 'all');
 

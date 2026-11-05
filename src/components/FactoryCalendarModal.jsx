@@ -29,8 +29,6 @@ export default function FactoryCalendarModal({
   onRefreshData,
   initialMonth = ''
 }) {
-  if (!isOpen) return null;
-
   const [activeTab, setActiveTab] = useState('calendar'); // 'calendar' | 'swap_wizard' | 'list'
   const [currentYear, setCurrentYear] = useState(
     initialMonth ? parseInt(initialMonth.slice(0, 4), 10) : new Date().getFullYear()

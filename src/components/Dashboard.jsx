@@ -972,13 +972,15 @@ export default function Dashboard({
       )}
 
       {/* EXCEPTION WORKERS MANAGEMENT MODAL */}
-      <ExceptionManagerModal
-        isOpen={showExceptionModal}
+      {showExceptionModal && (
+        <ExceptionManagerModal
+          isOpen={showExceptionModal}
         onClose={() => setShowExceptionModal(false)}
         workers={workers}
         onRefreshData={onRefreshData}
         onOpenIncompleteManager={onOpenIncompleteManager}
-      />
+        />
+      )}
 
     </div>
   );
