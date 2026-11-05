@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Edit3, CheckCircle, X, AlertTriangle } from 'lucide-react';
+import { Edit3, CheckCircle, X, AlertTriangle, Loader2 } from 'lucide-react';
 import { normalizeTimeInput } from '../utils/formatters';
 
 export default function EditModal({ record, staffNo, onSave, onCancel, loading }) {
@@ -117,10 +117,19 @@ export default function EditModal({ record, staffNo, onSave, onCancel, loading }
             <button
               type="submit"
               disabled={loading}
-              className="px-5 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-xl shadow-lg shadow-indigo-600/30 flex items-center space-x-2 transition-all"
+              className="px-5 py-2 text-sm font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-xl shadow-lg shadow-indigo-600/30 flex items-center space-x-2 transition-all disabled:opacity-60"
             >
-              <CheckCircle className="w-4 h-4" />
-              <span>Save & Log Edit</span>
+              {loading ? (
+                <>
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Saving...</span>
+                </>
+              ) : (
+                <>
+                  <CheckCircle className="w-4 h-4" />
+                  <span>Save & Log Edit</span>
+                </>
+              )}
             </button>
           </div>
 

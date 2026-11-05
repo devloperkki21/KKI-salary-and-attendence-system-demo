@@ -121,6 +121,7 @@ const memoryCache = {
   monthsExpiresAt: 0,
   dashboard: new Map(),
   workers: new Map(),
+  allAttendance: new Map(),
 };
 
 function invalidateAppCache() {
@@ -136,9 +137,21 @@ function invalidateAppCache() {
   memoryCache.monthsExpiresAt = 0;
   memoryCache.dashboard.clear();
   memoryCache.workers.clear();
+  memoryCache.allAttendance.clear();
   if (auth && typeof auth.invalidateAuthConfigCache === 'function') {
     auth.invalidateAuthConfigCache();
   }
+}
+
+function invalidateAttendanceCache(month) {
+  if (month) {
+    memoryCache.dashboard.delete(month);
+    memoryCache.workers.delete(month);
+    memoryCache.allAttendance.delete(month);
+  }
+  memoryCache.dashboard.delete('all');
+  memoryCache.workers.delete('all');
+  memoryCache.allAttendance.delete('all');
 }
 
 if (typeof setCacheInvalidator === 'function') {
@@ -1668,10 +1681,17 @@ app.delete('/api/holidays/:id', async (req, res) => {
   }
 });
 
-// 4d. GET All Daily Attendance Records (with optional ?month=YYYY-MM filter)
+// 4d. GET All Daily Attendance Records (with optional ?month=YYYY-MM filter, Cached with 60s TTL)
 app.get('/api/attendance/all', async (req, res) => {
   try {
     const { month } = req.query;
+    const cacheKey = month || 'all';
+    const now = Date.now();
+    const cached = memoryCache.allAttendance.get(cacheKey);
+    if (cached && now < cached.expiresAt) {
+      return res.json(cached.data);
+    }
+
     let query = `
       SELECT 
         d.*, 
@@ -1688,7 +1708,9 @@ app.get('/api/attendance/all', async (req, res) => {
     query += ` ORDER BY d.date DESC, CAST(d.staff_no AS INTEGER) ASC `;
 
     const result = await execute(query, params);
-    res.json({ success: true, records: result.rows });
+    const data = { success: true, records: result.rows };
+    memoryCache.allAttendance.set(cacheKey, { data, expiresAt: now + 60000 });
+    res.json(data);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -2049,7 +2071,7 @@ app.post('/api/workers/:staff_no/compensation', async (req, res) => {
   }
 });
 
-// 7. POST Attendance Manual Edit & Audit Log
+// 7. POST Attendance Manual Edit & Audit Log (OPTIMIZED - Single Combined Read + Single Transaction Batch Write)
 app.post('/api/attendance/edit', async (req, res) => {
   try {
     const { staff_no, date, raw_swipes, status, reason, edited_by } = req.body;
@@ -2057,23 +2079,27 @@ app.post('/api/attendance/edit', async (req, res) => {
       return res.status(400).json({ success: false, error: 'staff_no and date are required.' });
     }
 
-    const oldRes = await execute(
-      `SELECT * FROM daily_attendance WHERE staff_no = ? AND date = ?`,
-      [staff_no, date]
-    );
-    const oldRec = oldRes.rows[0] || {};
+    // Single combined read query for current record, assigned shift, and full worker history
+    const [settings, customRules, factoryCalendarMap, paidHolidaysMap, combinedRes] = await Promise.all([
+      getSettingsMap(),
+      getCustomRules(),
+      getFactoryCalendarMap(),
+      getPaidHolidaysMap(),
+      execute(`
+        SELECT 
+          (SELECT row_to_json(d) FROM daily_attendance d WHERE d.staff_no = ? AND d.date = ?) as current_record,
+          (SELECT assigned_shift FROM workers WHERE staff_no = ?) as assigned_shift,
+          (SELECT json_agg(h) FROM (SELECT staff_no, date, weekday, raw_swipes, original_raw_swipes, manual_punches, effective_in, effective_out, regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift, is_manual_override, override_reason, forfeiture_reason FROM daily_attendance WHERE staff_no = ? ORDER BY date ASC) h) as history;
+      `, [staff_no, date, staff_no, staff_no])
+    ]);
 
-    const settings = await getSettingsMap();
-    const customRules = await getCustomRules();
-    const factoryCalendarMap = await getFactoryCalendarMap();
-    const paidHolidaysMap = await getPaidHolidaysMap();
+    const oldRec = combinedRes.rows[0]?.current_record || {};
+    const workerAssignedShift = combinedRes.rows[0]?.assigned_shift || 'auto';
+    const workerHistory = combinedRes.rows[0]?.history || [];
 
     // Parse timestamps from newly provided raw_swipes (or fallback)
     const effectiveSwipes = raw_swipes !== undefined ? raw_swipes : (oldRec.raw_swipes || '');
     const { timestamps } = parseSwipeRecord(effectiveSwipes);
-
-    const workerRes = await execute(`SELECT assigned_shift FROM workers WHERE staff_no = ?`, [staff_no]);
-    const workerAssignedShift = workerRes.rows[0]?.assigned_shift || 'auto';
     const workerSettings = { ...settings, assigned_shift: workerAssignedShift };
 
     const calOverride = factoryCalendarMap[date] || null;
@@ -2104,40 +2130,6 @@ app.post('/api/attendance/edit', async (req, res) => {
       if (!effectiveOut || effectiveOut === '00:00') effectiveOut = '12:00';
     }
 
-    // Log to Audit Table
-    const auditEntry = {
-      staff_no,
-      date,
-      field_changed: 'Attendance Record',
-      old_value: `Swipes: ${oldRec.raw_swipes || ''}, Status: ${oldRec.status || ''}`,
-      new_value: `Swipes: ${effectiveSwipes}, Status: ${finalStatus}`,
-      edited_by: edited_by || 'Admin',
-      reason: reason || 'Manual correction',
-    };
-    await execute(
-      `INSERT INTO audit_logs (staff_no, date, field_changed, old_value, new_value, edited_by, reason)
-       VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      [
-        auditEntry.staff_no,
-        auditEntry.date,
-        auditEntry.field_changed,
-        auditEntry.old_value,
-        auditEntry.new_value,
-        auditEntry.edited_by,
-        auditEntry.reason,
-      ]
-    );
-    syncAuditLogToCloud(auditEntry).catch(() => {});
-
-    // Also update raw_punches so any future recomputations preserve new punches
-    await execute(
-      `INSERT INTO raw_punches (staff_no, date, weekday, swipe_record)
-       VALUES (?, ?, ?, ?)
-       ON CONFLICT(staff_no, date) DO UPDATE SET swipe_record = excluded.swipe_record`,
-      [staff_no, date, oldRec.weekday || '', effectiveSwipes]
-    );
-    await syncRawPunchesToCloud([{ staff_no, date, weekday: oldRec.weekday || '', swipe_record: effectiveSwipes }]);
-
     // Identify which tokens are manually added
     const originalSwipesStr = oldRec.original_raw_swipes || oldRec.raw_swipes || '';
     const originalTokens = new Set(originalSwipesStr.split(/\s+/).filter(Boolean));
@@ -2146,76 +2138,107 @@ app.post('/api/attendance/edit', async (req, res) => {
     const manualPunchesStr = addedTokens.join(' ');
     const finalOrigSwipes = oldRec.original_raw_swipes || oldRec.raw_swipes || effectiveSwipes;
 
-    // Upsert Daily Attendance (guarantees record exists even if not previously in daily_attendance)
-    await execute(
-      `INSERT INTO daily_attendance (
-         staff_no, date, weekday, raw_swipes, original_raw_swipes, effective_in, effective_out,
-         regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift,
-         is_manual_override, override_reason, manual_punches
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-       ON CONFLICT(staff_no, date) DO UPDATE SET
-         raw_swipes = excluded.raw_swipes,
-         original_raw_swipes = excluded.original_raw_swipes,
-         effective_in = excluded.effective_in,
-         effective_out = excluded.effective_out,
-         regular_hours = excluded.regular_hours,
-         ot_hours = excluded.ot_hours,
-         sunday_ot_hours = excluded.sunday_ot_hours,
-         total_hours = excluded.total_hours,
-         late_minutes = excluded.late_minutes,
-         status = excluded.status,
-         shift = excluded.shift,
-         is_manual_override = 1,
-         override_reason = excluded.override_reason,
-         manual_punches = excluded.manual_punches`,
-      [
-        staff_no,
-        date,
-        oldRec.weekday || computed.weekday || '',
-        effectiveSwipes,
-        finalOrigSwipes,
-        effectiveIn,
-        effectiveOut,
-        regularHours,
-        otHours,
-        sundayOtHours,
-        totalHours,
-        lateMinutes,
-        finalStatus,
-        computed.shift || '08:00',
-        reason || 'Manual correction',
-        manualPunchesStr,
-      ]
-    );
+    const batchStatements = [
+      {
+        sql: `INSERT INTO audit_logs (staff_no, date, field_changed, old_value, new_value, edited_by, reason)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          staff_no,
+          date,
+          'Attendance Record',
+          `Swipes: ${oldRec.raw_swipes || ''}, Status: ${oldRec.status || ''}`,
+          `Swipes: ${effectiveSwipes}, Status: ${finalStatus}`,
+          edited_by || 'Admin',
+          reason || 'Manual correction',
+        ]
+      },
+      {
+        sql: `INSERT INTO raw_punches (staff_no, date, weekday, swipe_record)
+              VALUES (?, ?, ?, ?)
+              ON CONFLICT(staff_no, date) DO UPDATE SET swipe_record = excluded.swipe_record`,
+        args: [staff_no, date, oldRec.weekday || '', effectiveSwipes]
+      },
+      {
+        sql: `INSERT INTO daily_attendance (
+                staff_no, date, weekday, raw_swipes, original_raw_swipes, effective_in, effective_out,
+                regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift,
+                is_manual_override, override_reason, manual_punches
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+              ON CONFLICT(staff_no, date) DO UPDATE SET
+                raw_swipes = excluded.raw_swipes,
+                original_raw_swipes = excluded.original_raw_swipes,
+                effective_in = excluded.effective_in,
+                effective_out = excluded.effective_out,
+                regular_hours = excluded.regular_hours,
+                ot_hours = excluded.ot_hours,
+                sunday_ot_hours = excluded.sunday_ot_hours,
+                total_hours = excluded.total_hours,
+                late_minutes = excluded.late_minutes,
+                status = excluded.status,
+                shift = excluded.shift,
+                is_manual_override = 1,
+                override_reason = excluded.override_reason,
+                manual_punches = excluded.manual_punches`,
+        args: [
+          staff_no,
+          date,
+          oldRec.weekday || computed.weekday || '',
+          effectiveSwipes,
+          finalOrigSwipes,
+          effectiveIn,
+          effectiveOut,
+          regularHours,
+          otHours,
+          sundayOtHours,
+          totalHours,
+          lateMinutes,
+          finalStatus,
+          computed.shift || '08:00',
+          reason || 'Manual correction',
+          manualPunchesStr,
+        ]
+      }
+    ];
 
-    // Re-evaluate Sunday forfeiture for this worker's month so Sunday paid status stays accurate
-    const workerAttRes = await execute(
-      `SELECT * FROM daily_attendance WHERE staff_no = ? ORDER BY date ASC`,
-      [staff_no]
-    );
-    const recheckedRecords = applyWeeklyOffForfeiture(workerAttRes.rows, settings);
+    // Re-evaluate Sunday forfeiture for this worker in-memory
+    const updatedHistory = [...workerHistory];
+    const hIdx = updatedHistory.findIndex(h => h.date === date);
+    const updatedItem = {
+      staff_no,
+      date,
+      status: finalStatus,
+      regular_hours: regularHours,
+      ot_hours: otHours,
+      sunday_ot_hours: sundayOtHours,
+      total_hours: totalHours,
+      is_manual_override: 1
+    };
+    if (hIdx >= 0) updatedHistory[hIdx] = updatedItem;
+    else updatedHistory.push(updatedItem);
+
+    const recheckedRecords = applyWeeklyOffForfeiture(updatedHistory, settings);
     for (const r of recheckedRecords) {
-      if (r.status.includes('Weekly Off')) {
-        await execute(
-          `UPDATE daily_attendance SET status = ? WHERE staff_no = ? AND date = ? AND is_manual_override = 0`,
-          [r.status, staff_no, r.date]
-        );
+      if (r.status.includes('Weekly Off') && r.is_manual_override !== 1) {
+        batchStatements.push({
+          sql: `UPDATE daily_attendance SET status = ? WHERE staff_no = ? AND date = ? AND is_manual_override = 0`,
+          args: [r.status, staff_no, r.date]
+        });
       }
     }
 
-    // Auto-backup to seed and cloud
-    await backupDatabaseToSeed();
-    try {
-      const updatedRow = await execute(`SELECT * FROM daily_attendance WHERE staff_no = ? AND date = ?`, [staff_no, date]);
-      if (updatedRow.rows[0]) {
-        await syncSingleAttendanceToCloud(updatedRow.rows[0]);
-      }
-    } catch (e) {
-      console.warn('Single attendance cloud sync error:', e.message);
-    }
+    // Execute all writes in ONE single atomic transaction batch!
+    await batch(batchStatements);
 
-    res.json({ success: true, message: 'Record updated, hours and overtime recalculated, and audit log saved.' });
+    // Invalidate only the touched month in cache
+    invalidateAttendanceCache(date.slice(0, 7));
+
+    res.json({
+      success: true,
+      message: 'Record updated, hours and overtime recalculated, and audit log saved.',
+      updated: { staff_no, date, status: finalStatus, regular_hours: regularHours, ot_hours: otHours, sunday_ot_hours: sundayOtHours, total_hours: totalHours }
+    });
   } catch (err) {
+    console.error('Attendance edit error:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -2343,7 +2366,7 @@ app.get('/api/attendance/incomplete', async (req, res) => {
   }
 });
 
-// POST Bulk Edit Attendance Records (Fast-Fix Center Batch Save)
+// POST Bulk Edit Attendance Records (Fast-Fix Center Batch Save - OPTIMIZED: Single Bulk Read + Single Transaction Batch Write)
 app.post('/api/attendance/bulk-edit', async (req, res) => {
   try {
     const { updates, reason, edited_by } = req.body;
@@ -2351,26 +2374,60 @@ app.post('/api/attendance/bulk-edit', async (req, res) => {
       return res.status(400).json({ success: false, error: 'updates array is required.' });
     }
 
-    const settings = await getSettingsMap();
-    const customRules = await getCustomRules();
-    const factoryCalendarMap = await getFactoryCalendarMap();
-    const paidHolidaysMap = await getPaidHolidaysMap();
+    const [settings, customRules, factoryCalendarMap, paidHolidaysMap] = await Promise.all([
+      getSettingsMap(),
+      getCustomRules(),
+      getFactoryCalendarMap(),
+      getPaidHolidaysMap()
+    ]);
+
+    const staffList = Array.from(new Set(updates.map(u => u.staff_no).filter(Boolean)));
+    if (staffList.length === 0) {
+      return res.json({ success: true, updatedCount: 0 });
+    }
+
+    // 1 single parallel read query for all touched workers' attendance and shifts
+    const staffInClause = staffList.map(s => escapeSqlVal(s)).join(',');
+    const combinedRes = await execute(`
+      SELECT 
+        (SELECT json_agg(d) FROM daily_attendance d WHERE d.staff_no IN (${staffInClause})) as attendance,
+        (SELECT json_agg(w) FROM (SELECT staff_no, assigned_shift FROM workers WHERE staff_no IN (${staffInClause})) w) as shifts;
+    `);
+
+    const oldAttList = combinedRes.rows[0]?.attendance || [];
+    const workerShiftList = combinedRes.rows[0]?.shifts || [];
+
+    const oldRecMap = new Map();
+    const workerAttHistoryMap = new Map();
+    for (const r of oldAttList) {
+      oldRecMap.set(`${r.staff_no}_${r.date}`, r);
+      if (!workerAttHistoryMap.has(r.staff_no)) {
+        workerAttHistoryMap.set(r.staff_no, []);
+      }
+      workerAttHistoryMap.get(r.staff_no).push(r);
+    }
+
+    const workerShiftMap = new Map();
+    for (const w of workerShiftList) {
+      workerShiftMap.set(w.staff_no, w.assigned_shift || 'auto');
+    }
+
+    const batchStatements = [];
     const modifiedStaffSet = new Set();
+    const modifiedMonths = new Set();
 
     for (const item of updates) {
       const { staff_no, date, raw_swipes, status } = item;
       if (!staff_no || !date) continue;
+      modifiedStaffSet.add(staff_no);
+      if (date) modifiedMonths.add(date.slice(0, 7));
 
-      const oldRes = await execute(
-        `SELECT * FROM daily_attendance WHERE staff_no = ? AND date = ?`,
-        [staff_no, date]
-      );
-      const oldRec = oldRes.rows[0] || {};
+      const key = `${staff_no}_${date}`;
+      const oldRec = oldRecMap.get(key) || {};
       const effectiveSwipes = raw_swipes !== undefined ? raw_swipes : (oldRec.raw_swipes || '');
       const { timestamps } = parseSwipeRecord(effectiveSwipes);
 
-      const workerRes = await execute(`SELECT assigned_shift FROM workers WHERE staff_no = ?`, [staff_no]);
-      const workerAssignedShift = workerRes.rows[0]?.assigned_shift || 'auto';
+      const workerAssignedShift = workerShiftMap.get(staff_no) || 'auto';
       const workerSettings = { ...settings, assigned_shift: workerAssignedShift };
 
       const calOverride = factoryCalendarMap[date] || null;
@@ -2400,28 +2457,27 @@ app.post('/api/attendance/bulk-edit', async (req, res) => {
         if (!effectiveOut || effectiveOut === '00:00') effectiveOut = '12:00';
       }
 
-      await execute(
-        `INSERT INTO audit_logs (staff_no, date, field_changed, old_value, new_value, edited_by, reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [
+      batchStatements.push({
+        sql: `INSERT INTO audit_logs (staff_no, date, field_changed, old_value, new_value, edited_by, reason)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: [
           staff_no,
           date,
           'Fast-Fix Bulk Edit',
           `Swipes: ${oldRec.raw_swipes || ''}, Status: ${oldRec.status || ''}`,
           `Swipes: ${effectiveSwipes}, Status: ${finalStatus}`,
           edited_by || 'Admin Fast-Fix',
-          reason || 'Fast-Fix Bulk Edit Resolution',
+          item.reason || reason || 'Fast-Fix Bulk Edit Resolution',
         ]
-      );
+      });
 
-      await execute(
-        `INSERT INTO raw_punches (staff_no, date, weekday, swipe_record)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(staff_no, date) DO UPDATE SET swipe_record = excluded.swipe_record`,
-        [staff_no, date, oldRec.weekday || '', effectiveSwipes]
-      );
+      batchStatements.push({
+        sql: `INSERT INTO raw_punches (staff_no, date, weekday, swipe_record)
+              VALUES (?, ?, ?, ?)
+              ON CONFLICT(staff_no, date) DO UPDATE SET swipe_record = excluded.swipe_record`,
+        args: [staff_no, date, oldRec.weekday || '', effectiveSwipes]
+      });
 
-      // Identify which tokens are manually added
       const originalSwipesStr = oldRec.original_raw_swipes || oldRec.raw_swipes || '';
       const originalTokens = new Set(originalSwipesStr.split(/\s+/).filter(Boolean));
       const newTokens = effectiveSwipes.split(/\s+/).filter(Boolean);
@@ -2429,28 +2485,28 @@ app.post('/api/attendance/bulk-edit', async (req, res) => {
       const manualPunchesStr = addedTokens.join(' ');
       const finalOrigSwipes = oldRec.original_raw_swipes || oldRec.raw_swipes || effectiveSwipes;
 
-      await execute(
-        `INSERT INTO daily_attendance (
-           staff_no, date, weekday, raw_swipes, original_raw_swipes, effective_in, effective_out,
-           regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift,
-           is_manual_override, override_reason, manual_punches
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
-         ON CONFLICT(staff_no, date) DO UPDATE SET
-           raw_swipes = excluded.raw_swipes,
-           original_raw_swipes = excluded.original_raw_swipes,
-           effective_in = excluded.effective_in,
-           effective_out = excluded.effective_out,
-           regular_hours = excluded.regular_hours,
-           ot_hours = excluded.ot_hours,
-           sunday_ot_hours = excluded.sunday_ot_hours,
-           total_hours = excluded.total_hours,
-           late_minutes = excluded.late_minutes,
-           status = excluded.status,
-           shift = excluded.shift,
-           is_manual_override = 1,
-           override_reason = excluded.override_reason,
-           manual_punches = excluded.manual_punches`,
-        [
+      batchStatements.push({
+        sql: `INSERT INTO daily_attendance (
+                staff_no, date, weekday, raw_swipes, original_raw_swipes, effective_in, effective_out,
+                regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift,
+                is_manual_override, override_reason, manual_punches
+              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+              ON CONFLICT(staff_no, date) DO UPDATE SET
+                raw_swipes = excluded.raw_swipes,
+                original_raw_swipes = excluded.original_raw_swipes,
+                effective_in = excluded.effective_in,
+                effective_out = excluded.effective_out,
+                regular_hours = excluded.regular_hours,
+                ot_hours = excluded.ot_hours,
+                sunday_ot_hours = excluded.sunday_ot_hours,
+                total_hours = excluded.total_hours,
+                late_minutes = excluded.late_minutes,
+                status = excluded.status,
+                shift = excluded.shift,
+                is_manual_override = 1,
+                override_reason = excluded.override_reason,
+                manual_punches = excluded.manual_punches`,
+        args: [
           staff_no,
           date,
           oldRec.weekday || computed.weekday || '',
@@ -2468,50 +2524,56 @@ app.post('/api/attendance/bulk-edit', async (req, res) => {
           item.reason || reason || 'Fast-Fix Resolution',
           manualPunchesStr,
         ]
-      );
+      });
 
-      modifiedStaffSet.add(staff_no);
+      // Update in-memory history
+      const history = workerAttHistoryMap.get(staff_no) || [];
+      const histIdx = history.findIndex(h => h.date === date);
+      const updatedRec = {
+        ...(oldRec || {}),
+        staff_no,
+        date,
+        status: finalStatus,
+        regular_hours: regularHours,
+        ot_hours: otHours,
+        sunday_ot_hours: sundayOtHours,
+        total_hours: totalHours,
+        is_manual_override: 1
+      };
+      if (histIdx >= 0) history[histIdx] = updatedRec;
+      else history.push(updatedRec);
     }
 
-    // Re-evaluate Sunday forfeiture for all touched workers
+    // Re-evaluate Sunday forfeiture for all touched workers in-memory
     for (const staffNo of modifiedStaffSet) {
-      const workerAttRes = await execute(
-        `SELECT * FROM daily_attendance WHERE staff_no = ? ORDER BY date ASC`,
-        [staffNo]
-      );
-      const recheckedRecords = applyWeeklyOffForfeiture(workerAttRes.rows, settings);
+      const history = (workerAttHistoryMap.get(staffNo) || []).sort((a, b) => (a.date > b.date ? 1 : -1));
+      const recheckedRecords = applyWeeklyOffForfeiture(history, settings);
       for (const r of recheckedRecords) {
-        if (r.status.includes('Weekly Off')) {
-          await execute(
-            `UPDATE daily_attendance SET status = ? WHERE staff_no = ? AND date = ? AND is_manual_override = 0`,
-            [r.status, staffNo, r.date]
-          );
+        if (r.status.includes('Weekly Off') && r.is_manual_override !== 1) {
+          batchStatements.push({
+            sql: `UPDATE daily_attendance SET status = ? WHERE staff_no = ? AND date = ? AND is_manual_override = 0`,
+            args: [r.status, staffNo, r.date]
+          });
         }
       }
     }
 
-    // Auto-backup to seed and cloud
-    await backupDatabaseToSeed();
-    try {
-      if (modifiedStaffSet.size > 0) {
-        const staffArr = Array.from(modifiedStaffSet);
-        const placeholders = staffArr.map(() => '?').join(',');
-        const res = await execute(`SELECT * FROM daily_attendance WHERE staff_no IN (${placeholders}) AND is_manual_override = 1`, staffArr);
-        if (res.rows && res.rows.length > 0) await syncAttendanceToCloud(res.rows);
-        const pRes = await execute(`SELECT * FROM raw_punches WHERE staff_no IN (${placeholders})`, staffArr);
-        if (pRes.rows && pRes.rows.length > 0) await syncRawPunchesToCloud(pRes.rows);
-      }
-    } catch (e) {
-      console.warn('Bulk edit cloud sync warning:', e.message);
+    // Execute ALL write statements in a single batch transaction!
+    await batch(batchStatements);
+
+    // Invalidate touched months in memory cache
+    for (const m of modifiedMonths) {
+      invalidateAttendanceCache(m);
     }
 
     res.json({ success: true, message: 'Bulk edit successfully processed.', updatedCount: updates.length });
   } catch (err) {
+    console.error('Bulk edit error:', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// 8. POST Advance Entry
+// 8. POST Advance Entry (OPTIMIZED - Fast Invalidation)
 app.post('/api/advances', async (req, res) => {
   try {
     const { staff_no, date, amount, note } = req.body;
@@ -2527,8 +2589,7 @@ app.post('/api/advances', async (req, res) => {
       [staff_no, effectiveDate, parsedAmount, note || '']
     );
 
-    syncAdvanceToCloud({ staff_no, date: effectiveDate, amount: parsedAmount, note: note || '' }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAttendanceCache(effectiveDate.slice(0, 7));
 
     res.json({ success: true, message: 'Advance recorded.' });
   } catch (err) {
@@ -2536,13 +2597,12 @@ app.post('/api/advances', async (req, res) => {
   }
 });
 
-// Delete Advance
+// Delete Advance (OPTIMIZED)
 app.delete('/api/advances/:id', async (req, res) => {
   try {
     const { id } = req.params;
     await execute(`DELETE FROM advances WHERE id = ?`, [id]);
-    deleteAdvanceFromCloud(id).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAttendanceCache();
     res.json({ success: true, message: 'Advance deleted.' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });

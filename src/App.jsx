@@ -455,8 +455,9 @@ export default function App() {
   };
 
   // Save manual attendance edit
+  const [editSaving, setEditSaving] = useState(false);
   const handleSaveEdit = async (editPayload) => {
-    setLoading(true);
+    setEditSaving(true);
     try {
       const res = await fetch('/api/attendance/edit', {
         method: 'POST',
@@ -473,7 +474,7 @@ export default function App() {
     } catch (err) {
       alert('Edit failed: ' + err.message);
     } finally {
-      setLoading(false);
+      setEditSaving(false);
     }
   };
 
@@ -836,7 +837,7 @@ export default function App() {
           staffNo={selectedStaffNo}
           onSave={handleSaveEdit}
           onCancel={() => setEditingRecord(null)}
-          loading={loading}
+          loading={editSaving}
         />
       )}
 
