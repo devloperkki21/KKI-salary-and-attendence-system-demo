@@ -72,8 +72,8 @@ export default function App() {
   const [editingRecord, setEditingRecord] = useState(null);
   const [advanceStaffNo, setAdvanceStaffNo] = useState(null);
 
-  // Fetch baseline metrics & worker list
-  const refreshData = async (overrideMonth = null) => {
+  // Fetch baseline metrics & worker list (BUTTER FAST: parallel + smart static cache)
+  const refreshData = async (overrideMonth = null, isSilent = false) => {
     try {
       const activeM = overrideMonth !== null ? overrideMonth : selectedMonth;
       const monthQuery = activeM && activeM !== 'all' ? `?month=${activeM}` : '';
@@ -89,20 +89,32 @@ export default function App() {
         }
       };
 
-      const [dashRes, workRes, setRes, auditRes, attAllRes, monthsRes] = await Promise.all([
+      const shouldFetchStatic = settingsList.length === 0 || availableMonths.length === 0;
+
+      const promises = [
         fetchJson(`/api/dashboard${monthQuery}`),
         fetchJson(`/api/workers${monthQuery}`),
-        fetchJson('/api/settings'),
-        fetchJson('/api/audit-logs'),
         fetchJson(`/api/attendance/all${monthQuery}`),
-        fetchJson('/api/months'),
-      ]);
+        fetchJson('/api/audit-logs'),
+      ];
+      if (shouldFetchStatic) {
+        promises.push(fetchJson('/api/settings'));
+        promises.push(fetchJson('/api/months'));
+      }
+
+      const results = await Promise.all(promises);
+      const dashRes = results[0];
+      const workRes = results[1];
+      const attAllRes = results[2];
+      const auditRes = results[3];
+      const setRes = shouldFetchStatic ? results[4] : null;
+      const monthsRes = shouldFetchStatic ? results[5] : null;
 
       if (dashRes && dashRes.success) setMetrics(dashRes.metrics);
       if (workRes && workRes.success) setWorkers(workRes.workers || []);
-      if (setRes && setRes.success) setSettingsList(setRes.settings || []);
-      if (auditRes && auditRes.success) setAuditLogs(auditRes.auditLogs || []);
       if (attAllRes && attAllRes.success) setAllAttendance(attAllRes.records || []);
+      if (auditRes && auditRes.success) setAuditLogs(auditRes.auditLogs || []);
+      if (setRes && setRes.success) setSettingsList(setRes.settings || []);
       if (monthsRes && monthsRes.success) {
         const monthsList = monthsRes.months || [];
         setAvailableMonths(monthsList);
@@ -454,10 +466,53 @@ export default function App() {
     setActiveTab('workers');
   };
 
-  // Save manual attendance edit
+  // Save manual attendance edit (BUTTER FAST: 0ms Optimistic UI + Silent Background Sync)
   const [editSaving, setEditSaving] = useState(false);
   const handleSaveEdit = async (editPayload) => {
-    setEditSaving(true);
+    const { staff_no, date, raw_swipes, status, reason } = editPayload;
+
+    // 1. Instantly close modal (0ms! Butter smooth!)
+    setEditingRecord(null);
+
+    // 2. Snapshot current state for rollback if network fails
+    const prevAllAttendance = [...allAttendance];
+    const prevWorkers = [...workers];
+
+    // 3. Optimistic local update (instantly visible in UI table in 0ms)
+    setAllAttendance(prev => prev.map(rec => {
+      if (rec.staff_no === staff_no && rec.date === date) {
+        return {
+          ...rec,
+          raw_swipes: raw_swipes !== undefined ? raw_swipes : rec.raw_swipes,
+          status: status || rec.status,
+          is_manual_override: 1,
+          override_reason: reason || rec.override_reason,
+        };
+      }
+      return rec;
+    }));
+
+    setWorkers(prev => prev.map(w => {
+      if (w.staff_no === staff_no && Array.isArray(w.attendance)) {
+        return {
+          ...w,
+          attendance: w.attendance.map(a => {
+            if (a.date === date) {
+              return {
+                ...a,
+                raw_swipes: raw_swipes !== undefined ? raw_swipes : a.raw_swipes,
+                status: status || a.status,
+                is_manual_override: 1
+              };
+            }
+            return a;
+          })
+        };
+      }
+      return w;
+    }));
+
+    // 4. Background network sync
     try {
       const res = await fetch('/api/attendance/edit', {
         method: 'POST',
@@ -465,16 +520,19 @@ export default function App() {
         body: JSON.stringify(editPayload),
       }).then(r => r.json());
 
-      if (res.success) {
-        setEditingRecord(null);
-        await refreshData();
+      if (res && res.success) {
+        // Silently update background overtime calculations
+        refreshData(selectedMonth, true);
       } else {
-        alert('Edit error: ' + res.error);
+        // Rollback on server error
+        setAllAttendance(prevAllAttendance);
+        setWorkers(prevWorkers);
+        alert('Edit error: ' + (res?.error || 'Failed to save record'));
       }
     } catch (err) {
-      alert('Edit failed: ' + err.message);
-    } finally {
-      setEditSaving(false);
+      setAllAttendance(prevAllAttendance);
+      setWorkers(prevWorkers);
+      alert('Network error while saving edit: ' + err.message);
     }
   };
 

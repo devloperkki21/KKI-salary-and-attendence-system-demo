@@ -444,7 +444,12 @@ export default function IncompleteManagerModal({
 
     const normSwipes = normalizeTimeInput(edit.raw_swipes);
 
-    setSavingRows(prev => ({ ...prev, [key]: true }));
+    // BUTTER FAST: Optimistically mark row as saved in 0ms!
+    setSavedRows(prev => ({ ...prev, [key]: true }));
+    setRowEdits(prev => ({
+      ...prev,
+      [key]: { ...prev[key], raw_swipes: normSwipes }
+    }));
 
     try {
       const res = await fetch('/api/attendance/bulk-edit', {
@@ -463,49 +468,53 @@ export default function IncompleteManagerModal({
         })
       }).then(r => r.json());
 
-      if (res.success) {
-        setSavedRows(prev => ({ ...prev, [key]: true }));
-        setRowEdits(prev => ({
-          ...prev,
-          [key]: { ...prev[key], raw_swipes: normSwipes }
-        }));
-        if (onRefreshData) onRefreshData();
+      if (res && res.success) {
+        if (onRefreshData) onRefreshData(null, true);
       } else {
-        alert('Save error: ' + res.error);
+        // Rollback
+        setSavedRows(prev => ({ ...prev, [key]: false }));
+        alert('Save error: ' + (res?.error || 'Failed to save row'));
       }
     } catch (err) {
+      setSavedRows(prev => ({ ...prev, [key]: false }));
       alert('Save failed: ' + err.message);
-    } finally {
-      setSavingRows(prev => ({ ...prev, [key]: false }));
     }
   };
 
-  // SUBMIT ALL MODIFIED RECORDS
+  // SUBMIT ALL MODIFIED RECORDS (BUTTER FAST: 0ms Optimistic Confirmation + Auto-Close)
   const handleSaveAll = async () => {
-    setSaving(true);
-    setGlobalSuccessMsg('');
+    const updates = [];
+    records.forEach(r => {
+      const key = `${r.staff_no}_${r.date}`;
+      const edit = rowEdits[key];
+      if (edit) {
+        updates.push({
+          staff_no: r.staff_no,
+          date: r.date,
+          raw_swipes: normalizeTimeInput(edit.raw_swipes),
+          status: edit.status,
+          reason: 'Fast-Fix Center Manual Resolution'
+        });
+      }
+    });
+
+    if (updates.length === 0) return;
+
+    // OPTIMISTIC: Immediately mark all selected rows as saved in 0ms!
+    const newSaved = {};
+    updates.forEach(u => {
+      newSaved[`${u.staff_no}_${u.date}`] = true;
+    });
+    setSavedRows(prev => ({ ...prev, ...newSaved }));
+    setGlobalSuccessMsg(`🎉 Successfully resolved ${updates.length} record(s)! Calculations unlocked.`);
+
+    // Auto close modal smoothly without making user wait
+    setTimeout(() => {
+      onClose();
+      if (onRefreshData) onRefreshData(null, true);
+    }, 500);
 
     try {
-      const updates = [];
-      records.forEach(r => {
-        const key = `${r.staff_no}_${r.date}`;
-        const edit = rowEdits[key];
-        if (edit) {
-          updates.push({
-            staff_no: r.staff_no,
-            date: r.date,
-            raw_swipes: normalizeTimeInput(edit.raw_swipes),
-            status: edit.status,
-            reason: 'Fast-Fix Center Manual Resolution'
-          });
-        }
-      });
-
-      if (updates.length === 0) {
-        setSaving(false);
-        return;
-      }
-
       const res = await fetch('/api/attendance/bulk-edit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -516,19 +525,12 @@ export default function IncompleteManagerModal({
         })
       }).then(r => r.json());
 
-      if (res.success) {
-        setGlobalSuccessMsg(`🎉 Successfully resolved ${res.updatedCount} record(s)! Worker calculations unlocked.`);
-        if (onRefreshData) await onRefreshData();
-        setTimeout(() => {
-          onClose();
-        }, 1200);
-      } else {
-        alert('Bulk update error: ' + res.error);
+      if (!res || !res.success) {
+        alert('Bulk update error: ' + (res?.error || 'Failed to save'));
+        if (onRefreshData) onRefreshData();
       }
     } catch (err) {
       alert('Save failed: ' + err.message);
-    } finally {
-      setSaving(false);
     }
   };
 

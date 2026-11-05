@@ -2079,23 +2079,40 @@ app.post('/api/attendance/edit', async (req, res) => {
       return res.status(400).json({ success: false, error: 'staff_no and date are required.' });
     }
 
-    // Single combined read query for current record, assigned shift, and full worker history
-    const [settings, customRules, factoryCalendarMap, paidHolidaysMap, combinedRes] = await Promise.all([
+    // Fast-path: Check in-memory cache first for instant 0ms read
+    const monthKey = date.slice(0, 7);
+    const cachedMonthAtt = memoryCache.allAttendance.get(monthKey);
+    let oldRec = null;
+    let workerAssignedShift = 'auto';
+    let workerHistory = null;
+
+    if (cachedMonthAtt && cachedMonthAtt.data && Array.isArray(cachedMonthAtt.data.records)) {
+      const records = cachedMonthAtt.data.records;
+      oldRec = records.find(r => r.staff_no === staff_no && r.date === date);
+      workerHistory = records.filter(r => r.staff_no === staff_no);
+      if (oldRec && oldRec.assigned_shift) workerAssignedShift = oldRec.assigned_shift;
+    }
+
+    const [settings, customRules, factoryCalendarMap, paidHolidaysMap] = await Promise.all([
       getSettingsMap(),
       getCustomRules(),
       getFactoryCalendarMap(),
-      getPaidHolidaysMap(),
-      execute(`
+      getPaidHolidaysMap()
+    ]);
+
+    // Fallback to database only if not found in warm in-memory cache
+    if (!oldRec || !workerHistory || workerHistory.length === 0) {
+      const combinedRes = await execute(`
         SELECT 
           (SELECT row_to_json(d) FROM daily_attendance d WHERE d.staff_no = ? AND d.date = ?) as current_record,
           (SELECT assigned_shift FROM workers WHERE staff_no = ?) as assigned_shift,
           (SELECT json_agg(h) FROM (SELECT staff_no, date, weekday, raw_swipes, original_raw_swipes, manual_punches, effective_in, effective_out, regular_hours, ot_hours, sunday_ot_hours, total_hours, late_minutes, status, shift, is_manual_override, override_reason, forfeiture_reason FROM daily_attendance WHERE staff_no = ? ORDER BY date ASC) h) as history;
-      `, [staff_no, date, staff_no, staff_no])
-    ]);
+      `, [staff_no, date, staff_no, staff_no]);
 
-    const oldRec = combinedRes.rows[0]?.current_record || {};
-    const workerAssignedShift = combinedRes.rows[0]?.assigned_shift || 'auto';
-    const workerHistory = combinedRes.rows[0]?.history || [];
+      oldRec = combinedRes.rows[0]?.current_record || {};
+      workerAssignedShift = combinedRes.rows[0]?.assigned_shift || 'auto';
+      workerHistory = combinedRes.rows[0]?.history || [];
+    }
 
     // Parse timestamps from newly provided raw_swipes (or fallback)
     const effectiveSwipes = raw_swipes !== undefined ? raw_swipes : (oldRec.raw_swipes || '');
