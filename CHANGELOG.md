@@ -1,5 +1,12 @@
 # 🚀 Factory Attendance & Payroll System - Major Update
 
+## Version 2.2 - October 2026 Attendance Recovery & Manual Overrides Sync
+- **October 2026 Biometric Ingestion**: 114 staff members and 3,534 attendance records fully processed in Demo environment.
+- **1 November Manual Punches Restored**: 25 manual overrides (group duty edits on 12-Oct, multi-day machine punch overrides for staff 092 & 543, Sunday OT adjustments for staff 317) 100% applied.
+- **Exception Worker Exemption**: Worker 290 (Suraj Driver) marked as flexible duty exception to streamline incomplete reviews.
+- **Database Schema Upgrades**: `forfeiture_reason` and `override_reason` column auto-migrations added for seamless uploads.
+- **Repository Seed Backup**: Synced live Demo state with all 12,851 attendance records and punches to `data/seed_data.json`.
+
 ## Version 2.0 - Advanced Features & Performance Boost
 
 ### ⚡ Performance Optimizations (50-100× Faster)
