@@ -63,6 +63,18 @@ export default function App() {
   const [showIncompleteModal, setShowIncompleteModal] = useState(false);
   const [incompleteStaffFilter, setIncompleteStaffFilter] = useState(null);
 
+  // Lazy load audit logs on-demand (keeps initial load butter-fast)
+  useEffect(() => {
+    if (activeTab === 'audit' && auditLogs.length === 0) {
+      fetch('/api/audit-logs')
+        .then(r => r.json())
+        .then(res => {
+          if (res && res.success) setAuditLogs(res.auditLogs || []);
+        })
+        .catch(() => {});
+    }
+  }, [activeTab]);
+
   // Selected worker details state
   const [selectedStaffNo, setSelectedStaffNo] = useState(null);
   const [selectedWorkerData, setSelectedWorkerData] = useState(null);

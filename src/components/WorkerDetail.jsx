@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   ArrowLeft,
   Printer,
@@ -44,6 +44,7 @@ export default function WorkerDetail({
   onSelectMonth
 }) {
   const [workerSearchTerm, setWorkerSearchTerm] = useState('');
+  const deferredWorkerSearchTerm = React.useDeferredValue(workerSearchTerm);
   const [showSearchDropdown, setShowSearchDropdown] = useState(false);
 
   // Special Rules Form State
@@ -235,15 +236,17 @@ export default function WorkerDetail({
   const prevWorker = currentIdx > 0 ? workers[currentIdx - 1] : null;
   const nextWorker = currentIdx >= 0 && currentIdx < (workers.length - 1) ? workers[currentIdx + 1] : null;
 
-  const filteredWorkersList = (workers || []).filter(w => {
-    if (!workerSearchTerm.trim()) return true;
-    const term = workerSearchTerm.toLowerCase();
-    return (
-      (w.staff_name || '').toLowerCase().includes(term) ||
-      (w.staff_no || '').toString().includes(term) ||
-      (w.department || '').toLowerCase().includes(term)
-    );
-  });
+  const filteredWorkersList = useMemo(() => {
+    if (!deferredWorkerSearchTerm.trim()) return workers || [];
+    const term = deferredWorkerSearchTerm.toLowerCase();
+    return (workers || []).filter(w => {
+      return (
+        (w.staff_name || '').toLowerCase().includes(term) ||
+        (w.staff_no || '').toString().includes(term) ||
+        (w.department || '').toLowerCase().includes(term)
+      );
+    });
+  }, [workers, deferredWorkerSearchTerm]);
 
   const getStatusBadge = (status) => {
     switch (status) {

@@ -1681,7 +1681,30 @@ app.delete('/api/holidays/:id', async (req, res) => {
   }
 });
 
-// 4d. GET All Daily Attendance Records (with optional ?month=YYYY-MM filter, Cached with 60s TTL)
+// 4d. GET All Daily Attendance Records (with optional ?month=YYYY-MM filter, Cached with 15m TTL)
+async function computeAttendanceAllData(month) {
+  let query = `
+    SELECT 
+      d.*, 
+      w.staff_name, 
+      w.department 
+    FROM daily_attendance d
+    LEFT JOIN workers w ON d.staff_no = w.staff_no
+  `;
+  const params = [];
+  if (month && month !== 'all') {
+    query += ` WHERE d.date LIKE ? `;
+    params.push(`${month}%`);
+  }
+  query += ` ORDER BY d.date DESC, CAST(d.staff_no AS INTEGER) ASC `;
+
+  const result = await execute(query, params);
+  const data = { success: true, records: result.rows };
+  const cacheKey = month || 'all';
+  memoryCache.allAttendance.set(cacheKey, { data, expiresAt: Date.now() + 900000 });
+  return data;
+}
+
 app.get('/api/attendance/all', async (req, res) => {
   try {
     const { month } = req.query;
@@ -1691,25 +1714,7 @@ app.get('/api/attendance/all', async (req, res) => {
     if (cached && now < cached.expiresAt) {
       return res.json(cached.data);
     }
-
-    let query = `
-      SELECT 
-        d.*, 
-        w.staff_name, 
-        w.department 
-      FROM daily_attendance d
-      LEFT JOIN workers w ON d.staff_no = w.staff_no
-    `;
-    const params = [];
-    if (month && month !== 'all') {
-      query += ` WHERE d.date LIKE ? `;
-      params.push(`${month}%`);
-    }
-    query += ` ORDER BY d.date DESC, CAST(d.staff_no AS INTEGER) ASC `;
-
-    const result = await execute(query, params);
-    const data = { success: true, records: result.rows };
-    memoryCache.allAttendance.set(cacheKey, { data, expiresAt: now + 60000 });
+    const data = await computeAttendanceAllData(month);
     res.json(data);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -1717,6 +1722,118 @@ app.get('/api/attendance/all', async (req, res) => {
 });
 
 // 5. GET All Workers & Payroll Summary (OPTIMIZED - Single Query Batch, optional ?month=YYYY-MM filter)
+async function computeWorkersData(month) {
+  const settings = await getSettingsMap();
+  const salaryRules = await getSalaryRules();
+
+  const isMonthFiltered = month && month !== 'all';
+  let attQuery = `
+    SELECT d.*, r.swipe_record as original_raw_swipes 
+    FROM daily_attendance d 
+    LEFT JOIN raw_punches r ON d.staff_no = r.staff_no AND d.date = r.date
+  `;
+  let advQuery = `SELECT * FROM advances`;
+  const attParams = [];
+  const advParams = [];
+
+  if (isMonthFiltered) {
+    attQuery += ` WHERE d.date LIKE ?`;
+    attParams.push(`${month}%`);
+    advQuery += ` WHERE date LIKE ?`;
+    advParams.push(`${month}%`);
+  }
+  attQuery += ` ORDER BY d.staff_no, d.date ASC`;
+  advQuery += ` ORDER BY staff_no, date DESC`;
+
+  const workersSql = isMonthFiltered
+    ? `
+      SELECT 
+        d.staff_no,
+        COALESCE(w.staff_name, d.staff_no) as staff_name,
+        COALESCE(w.department, 'WORKER') as department,
+        COALESCE(w.monthly_salary, 15000) as monthly_salary,
+        COALESCE(w.housing_allowance, 0) as housing_allowance,
+        COALESCE(w.food_allowance, 0) as food_allowance,
+        COALESCE(w.other_allowance, 0) as other_allowance,
+        COALESCE(w.assigned_shift, 'auto') as assigned_shift,
+        COALESCE(w.is_exception, 0) as is_exception,
+        COALESCE(w.exception_reason, '') as exception_reason
+      FROM (
+        SELECT DISTINCT staff_no FROM daily_attendance WHERE date LIKE ?
+      ) d
+      LEFT JOIN workers w ON d.staff_no = w.staff_no
+      ORDER BY CAST(d.staff_no AS INTEGER) ASC
+    `
+    : `
+      SELECT 
+        COALESCE(w.staff_no, d.staff_no) as staff_no,
+        COALESCE(w.staff_name, d.staff_no) as staff_name,
+        COALESCE(w.department, 'WORKER') as department,
+        COALESCE(w.monthly_salary, 15000) as monthly_salary,
+        COALESCE(w.housing_allowance, 0) as housing_allowance,
+        COALESCE(w.food_allowance, 0) as food_allowance,
+        COALESCE(w.other_allowance, 0) as other_allowance,
+        COALESCE(w.assigned_shift, 'auto') as assigned_shift,
+        COALESCE(w.is_exception, 0) as is_exception,
+        COALESCE(w.exception_reason, '') as exception_reason
+      FROM (
+        SELECT DISTINCT staff_no FROM daily_attendance
+        UNION
+        SELECT staff_no FROM workers
+      ) d
+      LEFT JOIN workers w ON d.staff_no = w.staff_no
+      ORDER BY CAST(d.staff_no AS INTEGER) ASC
+    `;
+
+  const [workersRes, allAttendanceRes, allAdvancesRes] = await Promise.all([
+    execute(workersSql, isMonthFiltered ? [`${month}%`] : []),
+    execute(attQuery, attParams),
+    execute(advQuery, advParams)
+  ]);
+
+  const attendanceMap = new Map();
+  const advancesMap = new Map();
+
+  allAttendanceRes.rows.forEach(r => {
+    if (!attendanceMap.has(r.staff_no)) attendanceMap.set(r.staff_no, []);
+    attendanceMap.get(r.staff_no).push(r);
+  });
+
+  allAdvancesRes.rows.forEach(r => {
+    if (!advancesMap.has(r.staff_no)) advancesMap.set(r.staff_no, []);
+    advancesMap.get(r.staff_no).push(r);
+  });
+
+  const resultList = workersRes.rows.map(w => {
+    const dailyRecords = attendanceMap.get(w.staff_no) || [];
+    const advances = advancesMap.get(w.staff_no) || [];
+
+    const payroll = calculateWorkerPayroll({
+      staffNo: w.staff_no,
+      monthlySalary: w.monthly_salary,
+      housingAllowance: w.housing_allowance,
+      foodAllowance: w.food_allowance,
+      otherAllowance: w.other_allowance,
+      dailyRecords,
+      advances,
+      settings,
+      salaryRules,
+    });
+
+    return {
+      ...w,
+      payroll,
+      recordCount: dailyRecords.length,
+      dailyRecords,
+    };
+  });
+
+  const workersPayload = { success: true, workers: resultList };
+  const cacheKey = month || 'all';
+  memoryCache.workers.set(cacheKey, { data: workersPayload, expiresAt: Date.now() + 900000 });
+  return workersPayload;
+}
+
 app.get('/api/workers', async (req, res) => {
   try {
     const { month } = req.query;
@@ -1726,118 +1843,8 @@ app.get('/api/workers', async (req, res) => {
     if (cached && now < cached.expiresAt) {
       return res.json(cached.data);
     }
-
-    const settings = await getSettingsMap();
-    const salaryRules = await getSalaryRules();
-
-    const isMonthFiltered = month && month !== 'all';
-    let attQuery = `
-      SELECT d.*, r.swipe_record as original_raw_swipes 
-      FROM daily_attendance d 
-      LEFT JOIN raw_punches r ON d.staff_no = r.staff_no AND d.date = r.date
-    `;
-    let advQuery = `SELECT * FROM advances`;
-    const attParams = [];
-    const advParams = [];
-
-    if (isMonthFiltered) {
-      attQuery += ` WHERE d.date LIKE ?`;
-      attParams.push(`${month}%`);
-      advQuery += ` WHERE date LIKE ?`;
-      advParams.push(`${month}%`);
-    }
-    attQuery += ` ORDER BY d.staff_no, d.date ASC`;
-    advQuery += ` ORDER BY staff_no, date DESC`;
-
-    const workersSql = isMonthFiltered
-      ? `
-        SELECT 
-          d.staff_no,
-          COALESCE(w.staff_name, d.staff_no) as staff_name,
-          COALESCE(w.department, 'WORKER') as department,
-          COALESCE(w.monthly_salary, 15000) as monthly_salary,
-          COALESCE(w.housing_allowance, 0) as housing_allowance,
-          COALESCE(w.food_allowance, 0) as food_allowance,
-          COALESCE(w.other_allowance, 0) as other_allowance,
-          COALESCE(w.assigned_shift, 'auto') as assigned_shift,
-          COALESCE(w.is_exception, 0) as is_exception,
-          COALESCE(w.exception_reason, '') as exception_reason
-        FROM (
-          SELECT DISTINCT staff_no FROM daily_attendance WHERE date LIKE ?
-        ) d
-        LEFT JOIN workers w ON d.staff_no = w.staff_no
-        ORDER BY CAST(d.staff_no AS INTEGER) ASC
-      `
-      : `
-        SELECT 
-          COALESCE(w.staff_no, d.staff_no) as staff_no,
-          COALESCE(w.staff_name, d.staff_no) as staff_name,
-          COALESCE(w.department, 'WORKER') as department,
-          COALESCE(w.monthly_salary, 15000) as monthly_salary,
-          COALESCE(w.housing_allowance, 0) as housing_allowance,
-          COALESCE(w.food_allowance, 0) as food_allowance,
-          COALESCE(w.other_allowance, 0) as other_allowance,
-          COALESCE(w.assigned_shift, 'auto') as assigned_shift,
-          COALESCE(w.is_exception, 0) as is_exception,
-          COALESCE(w.exception_reason, '') as exception_reason
-        FROM (
-          SELECT DISTINCT staff_no FROM daily_attendance
-          UNION
-          SELECT staff_no FROM workers
-        ) d
-        LEFT JOIN workers w ON d.staff_no = w.staff_no
-        ORDER BY CAST(d.staff_no AS INTEGER) ASC
-      `;
-
-    // Batch fetch all data in parallel
-    const [workersRes, allAttendanceRes, allAdvancesRes] = await Promise.all([
-      execute(workersSql, isMonthFiltered ? [`${month}%`] : []),
-      execute(attQuery, attParams),
-      execute(advQuery, advParams)
-    ]);
-
-    // Index attendance and advances by staff_no for O(1) lookup
-    const attendanceMap = new Map();
-    const advancesMap = new Map();
-
-    allAttendanceRes.rows.forEach(r => {
-      if (!attendanceMap.has(r.staff_no)) attendanceMap.set(r.staff_no, []);
-      attendanceMap.get(r.staff_no).push(r);
-    });
-
-    allAdvancesRes.rows.forEach(r => {
-      if (!advancesMap.has(r.staff_no)) advancesMap.set(r.staff_no, []);
-      advancesMap.get(r.staff_no).push(r);
-    });
-
-    // Compute payroll for all workers
-    const resultList = workersRes.rows.map(w => {
-      const dailyRecords = attendanceMap.get(w.staff_no) || [];
-      const advances = advancesMap.get(w.staff_no) || [];
-
-      const payroll = calculateWorkerPayroll({
-        staffNo: w.staff_no,
-        monthlySalary: w.monthly_salary,
-        housingAllowance: w.housing_allowance,
-        foodAllowance: w.food_allowance,
-        otherAllowance: w.other_allowance,
-        dailyRecords,
-        advances,
-        settings,
-        salaryRules,
-      });
-
-      return {
-        ...w,
-        payroll,
-        recordCount: dailyRecords.length,
-        dailyRecords,
-      };
-    });
-
-    const workersPayload = { success: true, workers: resultList };
-    memoryCache.workers.set(cacheKey, { data: workersPayload, expiresAt: now + 30000 });
-    res.json(workersPayload);
+    const data = await computeWorkersData(month);
+    res.json(data);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -2737,6 +2744,160 @@ function detectActiveMonthDetails(minDate, maxDate) {
 }
 
 // 10. GET Dashboard Metrics (OPTIMIZED - Parallel Batch Fetch with Active Month Detection, optional ?month=YYYY-MM)
+async function computeDashboardMetrics(month) {
+  const settings = await getSettingsMap();
+  const salaryRules = await getSalaryRules();
+
+  const isMonthFiltered = month && month !== 'all';
+  const dateCond = isMonthFiltered ? ` WHERE date LIKE ? ` : '';
+  const dateParams = isMonthFiltered ? [`${month}%`] : [];
+  const whereDaily = dateCond;
+  const whereAdvances = dateCond;
+  const whereBounds = isMonthFiltered
+    ? `WHERE date LIKE ? AND date IS NOT NULL AND date != ''`
+    : `WHERE date IS NOT NULL AND date != ''`;
+
+  const workersSql = isMonthFiltered
+    ? `
+      SELECT 
+        d.staff_no,
+        COALESCE(w.staff_name, d.staff_no) as staff_name,
+        COALESCE(w.department, 'WORKER') as department,
+        COALESCE(w.monthly_salary, 15000) as monthly_salary,
+        COALESCE(w.housing_allowance, 0) as housing_allowance,
+        COALESCE(w.food_allowance, 0) as food_allowance,
+        COALESCE(w.other_allowance, 0) as other_allowance,
+        COALESCE(w.assigned_shift, 'auto') as assigned_shift
+      FROM (
+        SELECT DISTINCT staff_no FROM daily_attendance WHERE date LIKE ?
+      ) d
+      LEFT JOIN workers w ON d.staff_no = w.staff_no
+      ORDER BY CAST(d.staff_no AS INTEGER) ASC
+    `
+    : `
+      SELECT 
+        COALESCE(w.staff_no, d.staff_no) as staff_no,
+        COALESCE(w.staff_name, d.staff_no) as staff_name,
+        COALESCE(w.department, 'WORKER') as department,
+        COALESCE(w.monthly_salary, 15000) as monthly_salary,
+        COALESCE(w.housing_allowance, 0) as housing_allowance,
+        COALESCE(w.food_allowance, 0) as food_allowance,
+        COALESCE(w.other_allowance, 0) as other_allowance,
+        COALESCE(w.assigned_shift, 'auto') as assigned_shift
+      FROM (
+        SELECT DISTINCT staff_no FROM daily_attendance
+        UNION
+        SELECT staff_no FROM workers
+      ) d
+      LEFT JOIN workers w ON d.staff_no = w.staff_no
+      ORDER BY CAST(d.staff_no AS INTEGER) ASC
+    `;
+
+  const workersCountSql = isMonthFiltered
+    ? `SELECT COUNT(DISTINCT staff_no) as cnt FROM daily_attendance WHERE date LIKE ?`
+    : `
+      SELECT COUNT(DISTINCT staff_no) as cnt FROM (
+        SELECT staff_no FROM workers
+        UNION
+        SELECT DISTINCT staff_no FROM daily_attendance
+      )
+    `;
+
+  const [workersCountRes, recordsCountRes, statusCountsRes, workersRes, allAttendanceRes, allAdvancesRes, dateBoundsRes, incompleteCount] = await Promise.all([
+    execute(workersCountSql, isMonthFiltered ? [`${month}%`] : []),
+    execute(`SELECT COUNT(*) as cnt FROM daily_attendance ${whereDaily}`, dateParams),
+    execute(`SELECT status, COUNT(*) as cnt FROM daily_attendance ${whereDaily} GROUP BY status`, dateParams),
+    execute(workersSql, isMonthFiltered ? [`${month}%`] : []),
+    execute(`SELECT * FROM daily_attendance ${whereDaily} ORDER BY staff_no`, dateParams),
+    execute(`SELECT * FROM advances ${whereAdvances} ORDER BY staff_no`, dateParams),
+    execute(`SELECT MIN(date) as min_date, MAX(date) as max_date FROM daily_attendance ${whereBounds}`, isMonthFiltered ? [`${month}%`] : []),
+    getTrueIncompleteCount(month)
+  ]);
+
+  const totalWorkers = workersCountRes.rows[0]?.cnt || 0;
+  const totalRecords = recordsCountRes.rows[0]?.cnt || 0;
+  const minDate = dateBoundsRes.rows[0]?.min_date || '';
+  const maxDate = dateBoundsRes.rows[0]?.max_date || '';
+
+  let activeMonth;
+  if (isMonthFiltered && (!minDate || !maxDate)) {
+    const parts = month.split('-');
+    const y = parts[0];
+    const mNum = parseInt(parts[1], 10);
+    const name = (mNum >= 1 && mNum <= 12) ? MONTH_NAMES[mNum - 1] : month;
+    const totalDays = new Date(parseInt(y, 10), mNum, 0).getDate();
+    activeMonth = {
+      monthKey: month,
+      monthName: name,
+      year: y,
+      label: `${name} ${y}`,
+      startDate: `${month}-01`,
+      endDate: `${month}-${String(totalDays).padStart(2, '0')}`,
+      totalDays
+    };
+  } else {
+    activeMonth = detectActiveMonthDetails(minDate, maxDate);
+  }
+
+  const statusBreakdown = {};
+  statusCountsRes.rows.forEach(r => { statusBreakdown[r.status] = r.cnt; });
+
+  const attendanceMap = new Map();
+  const advancesMap = new Map();
+
+  allAttendanceRes.rows.forEach(r => {
+    if (!attendanceMap.has(r.staff_no)) attendanceMap.set(r.staff_no, []);
+    attendanceMap.get(r.staff_no).push(r);
+  });
+
+  allAdvancesRes.rows.forEach(r => {
+    if (!advancesMap.has(r.staff_no)) advancesMap.set(r.staff_no, []);
+    advancesMap.get(r.staff_no).push(r);
+  });
+
+  let grandGross = 0;
+  let grandAdvances = 0;
+  let grandNet = 0;
+
+  workersRes.rows.forEach(w => {
+    const dailyRecords = attendanceMap.get(w.staff_no) || [];
+    const advances = advancesMap.get(w.staff_no) || [];
+
+    const p = calculateWorkerPayroll({
+      staffNo: w.staff_no,
+      monthlySalary: w.monthly_salary,
+      housingAllowance: w.housing_allowance,
+      foodAllowance: w.food_allowance,
+      otherAllowance: w.other_allowance,
+      dailyRecords,
+      advances,
+      settings,
+      salaryRules,
+    });
+
+    grandGross += p.grossSalary;
+    grandAdvances += p.totalAdvances;
+    grandNet += p.netPayable;
+  });
+
+  const dashPayload = {
+    success: true,
+    metrics: {
+      totalWorkers,
+      totalRecords,
+      incompleteCount,
+      grandGross: +grandGross.toFixed(2),
+      grandAdvances: +grandAdvances.toFixed(2),
+      grandNet: +grandNet.toFixed(2),
+      statusBreakdown,
+      activeMonth,
+    },
+  };
+  const cacheKey = month || 'all';
+  memoryCache.dashboard.set(cacheKey, { data: dashPayload, expiresAt: Date.now() + 900000 });
+  return dashPayload;
+}
+
 app.get('/api/dashboard', async (req, res) => {
   try {
     const { month } = req.query;
@@ -2746,164 +2907,39 @@ app.get('/api/dashboard', async (req, res) => {
     if (cached && now < cached.expiresAt) {
       return res.json(cached.data);
     }
-
-    const settings = await getSettingsMap();
-    const salaryRules = await getSalaryRules();
-
-    const isMonthFiltered = month && month !== 'all';
-    const dateCond = isMonthFiltered ? ` WHERE date LIKE ? ` : '';
-    const dateParams = isMonthFiltered ? [`${month}%`] : [];
-    const whereDaily = dateCond;
-    const whereAdvances = dateCond;
-    const whereBounds = isMonthFiltered
-      ? `WHERE date LIKE ? AND date IS NOT NULL AND date != ''`
-      : `WHERE date IS NOT NULL AND date != ''`;
-
-    const workersSql = isMonthFiltered
-      ? `
-        SELECT 
-          d.staff_no,
-          COALESCE(w.staff_name, d.staff_no) as staff_name,
-          COALESCE(w.department, 'WORKER') as department,
-          COALESCE(w.monthly_salary, 15000) as monthly_salary,
-          COALESCE(w.housing_allowance, 0) as housing_allowance,
-          COALESCE(w.food_allowance, 0) as food_allowance,
-          COALESCE(w.other_allowance, 0) as other_allowance,
-          COALESCE(w.assigned_shift, 'auto') as assigned_shift
-        FROM (
-          SELECT DISTINCT staff_no FROM daily_attendance WHERE date LIKE ?
-        ) d
-        LEFT JOIN workers w ON d.staff_no = w.staff_no
-        ORDER BY CAST(d.staff_no AS INTEGER) ASC
-      `
-      : `
-        SELECT 
-          COALESCE(w.staff_no, d.staff_no) as staff_no,
-          COALESCE(w.staff_name, d.staff_no) as staff_name,
-          COALESCE(w.department, 'WORKER') as department,
-          COALESCE(w.monthly_salary, 15000) as monthly_salary,
-          COALESCE(w.housing_allowance, 0) as housing_allowance,
-          COALESCE(w.food_allowance, 0) as food_allowance,
-          COALESCE(w.other_allowance, 0) as other_allowance,
-          COALESCE(w.assigned_shift, 'auto') as assigned_shift
-        FROM (
-          SELECT DISTINCT staff_no FROM daily_attendance
-          UNION
-          SELECT staff_no FROM workers
-        ) d
-        LEFT JOIN workers w ON d.staff_no = w.staff_no
-        ORDER BY CAST(d.staff_no AS INTEGER) ASC
-      `;
-
-    const workersCountSql = isMonthFiltered
-      ? `SELECT COUNT(DISTINCT staff_no) as cnt FROM daily_attendance WHERE date LIKE ?`
-      : `
-        SELECT COUNT(DISTINCT staff_no) as cnt FROM (
-          SELECT staff_no FROM workers
-          UNION
-          SELECT DISTINCT staff_no FROM daily_attendance
-        )
-      `;
-
-    // Execute all count queries and incomplete calculation in parallel
-    const [workersCountRes, recordsCountRes, statusCountsRes, workersRes, allAttendanceRes, allAdvancesRes, dateBoundsRes, incompleteCount] = await Promise.all([
-      execute(workersCountSql, isMonthFiltered ? [`${month}%`] : []),
-      execute(`SELECT COUNT(*) as cnt FROM daily_attendance ${whereDaily}`, dateParams),
-      execute(`SELECT status, COUNT(*) as cnt FROM daily_attendance ${whereDaily} GROUP BY status`, dateParams),
-      execute(workersSql, isMonthFiltered ? [`${month}%`] : []),
-      execute(`SELECT * FROM daily_attendance ${whereDaily} ORDER BY staff_no`, dateParams),
-      execute(`SELECT * FROM advances ${whereAdvances} ORDER BY staff_no`, dateParams),
-      execute(`SELECT MIN(date) as min_date, MAX(date) as max_date FROM daily_attendance ${whereBounds}`, isMonthFiltered ? [`${month}%`] : []),
-      getTrueIncompleteCount(month)
-    ]);
-
-    const totalWorkers = workersCountRes.rows[0]?.cnt || 0;
-    const totalRecords = recordsCountRes.rows[0]?.cnt || 0;
-    const minDate = dateBoundsRes.rows[0]?.min_date || '';
-    const maxDate = dateBoundsRes.rows[0]?.max_date || '';
-
-    let activeMonth;
-    if (isMonthFiltered && (!minDate || !maxDate)) {
-      const parts = month.split('-');
-      const y = parts[0];
-      const mNum = parseInt(parts[1], 10);
-      const name = (mNum >= 1 && mNum <= 12) ? MONTH_NAMES[mNum - 1] : month;
-      const totalDays = new Date(parseInt(y, 10), mNum, 0).getDate();
-      activeMonth = {
-        monthKey: month,
-        monthName: name,
-        year: y,
-        label: `${name} ${y}`,
-        startDate: `${month}-01`,
-        endDate: `${month}-${String(totalDays).padStart(2, '0')}`,
-        totalDays
-      };
-    } else {
-      activeMonth = detectActiveMonthDetails(minDate, maxDate);
-    }
-
-    const statusBreakdown = {};
-    statusCountsRes.rows.forEach(r => { statusBreakdown[r.status] = r.cnt; });
-
-    // Index attendance and advances by staff_no
-    const attendanceMap = new Map();
-    const advancesMap = new Map();
-
-    allAttendanceRes.rows.forEach(r => {
-      if (!attendanceMap.has(r.staff_no)) attendanceMap.set(r.staff_no, []);
-      attendanceMap.get(r.staff_no).push(r);
-    });
-
-    allAdvancesRes.rows.forEach(r => {
-      if (!advancesMap.has(r.staff_no)) advancesMap.set(r.staff_no, []);
-      advancesMap.get(r.staff_no).push(r);
-    });
-
-    // Calculate total payroll in single pass
-    let grandGross = 0;
-    let grandAdvances = 0;
-    let grandNet = 0;
-
-    workersRes.rows.forEach(w => {
-      const dailyRecords = attendanceMap.get(w.staff_no) || [];
-      const advances = advancesMap.get(w.staff_no) || [];
-
-      const p = calculateWorkerPayroll({
-        staffNo: w.staff_no,
-        monthlySalary: w.monthly_salary,
-        housingAllowance: w.housing_allowance,
-        foodAllowance: w.food_allowance,
-        otherAllowance: w.other_allowance,
-        dailyRecords,
-        advances,
-        settings,
-        salaryRules,
-      });
-
-      grandGross += p.grossSalary;
-      grandAdvances += p.totalAdvances;
-      grandNet += p.netPayable;
-    });
-
-    const dashPayload = {
-      success: true,
-      metrics: {
-        totalWorkers,
-        totalRecords,
-        incompleteCount,
-        grandGross: +grandGross.toFixed(2),
-        grandAdvances: +grandAdvances.toFixed(2),
-        grandNet: +grandNet.toFixed(2),
-        statusBreakdown,
-        activeMonth,
-      },
-    };
-    memoryCache.dashboard.set(cacheKey, { data: dashPayload, expiresAt: now + 30000 });
-    res.json(dashPayload);
+    const data = await computeDashboardMetrics(month);
+    res.json(data);
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// Warm cache helper on startup for butter-fast 0ms initial load
+async function warmCacheOnStartup() {
+  try {
+    console.log('⚡ Warming in-memory cache for butter-fast startup...');
+    const t0 = Date.now();
+    await Promise.all([
+      getSettingsMap(),
+      getCustomRules(),
+      getSalaryRules(),
+      getFactoryCalendarMap(),
+      getPaidHolidaysMap()
+    ]);
+
+    const latestRes = await execute(`SELECT date FROM daily_attendance WHERE date IS NOT NULL AND date != '' ORDER BY date DESC LIMIT 1`);
+    const targetMonth = latestRes.rows[0]?.date ? latestRes.rows[0].date.slice(0, 7) : '2026-10';
+
+    await Promise.all([
+      computeDashboardMetrics(targetMonth),
+      computeWorkersData(targetMonth),
+      computeAttendanceAllData(targetMonth)
+    ]);
+    console.log(`⚡ In-memory cache warmed for ${targetMonth} in ${Date.now() - t0}ms! 0ms instant responses ready.`);
+  } catch (err) {
+    console.warn('Cache pre-warm warning:', err.message);
+  }
+}
 
 // 11. POST Google Sheets Live Sync (OPTIMIZED)
 app.post('/api/google-sheets/sync', async (req, res) => {
@@ -4037,6 +4073,7 @@ app.listen(PORT, '0.0.0.0', () => {
   
   initDatabase().then(() => {
     console.log('✅ Attendance & Payroll Database Initialized & Connected.');
+    warmCacheOnStartup().catch(() => {});
   }).catch(err => {
     console.error('Failed to initialize database:', err);
   });

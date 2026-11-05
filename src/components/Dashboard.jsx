@@ -31,6 +31,241 @@ import { formatHours } from '../utils/formatters';
 import ExceptionManagerModal from './ExceptionManagerModal';
 import HoursCalculatorWidget from './HoursCalculatorWidget';
 
+
+// Memoized Worker Card for 60fps Butter-Fast Search & Grid Rendering
+const WorkerCard = React.memo(function WorkerCard({
+  worker,
+  isPayrollUnlocked,
+  onSelect
+}) {
+  const p = worker.payroll || {};
+  const totalOtSum = (p.totalOtHours || 0) + (p.totalSundayOtHours || 0);
+
+  return (
+    <div
+      onClick={() => onSelect(worker.staff_no)}
+      className="p-5 rounded-2xl bg-slate-950 border-2 border-slate-700 hover:border-blue-400 hover:bg-slate-900 transition-all cursor-pointer group shadow-md"
+    >
+      <div className="flex items-start justify-between">
+        <div className="flex items-center space-x-3.5">
+          <div className="px-3 py-2 rounded-xl bg-blue-950 text-cyan-300 border border-blue-700 font-mono font-bold text-base">
+            #{worker.staff_no}
+          </div>
+          <div>
+            <div className="flex items-center gap-2">
+              <h4 className="text-base font-bold text-white group-hover:text-blue-300 transition-colors">
+                {worker.staff_name}
+              </h4>
+              {(worker.is_exception === 1 || ['exempt', 'flexible', 'exception'].includes(worker.assigned_shift)) && (
+                <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-400 text-slate-950 font-black flex items-center gap-0.5">
+                  <Star className="w-2.5 h-2.5 fill-current" /> EXEMPT
+                </span>
+              )}
+            </div>
+            <span className="text-xs px-2.5 py-0.5 rounded bg-slate-800 text-slate-300 font-bold uppercase border border-slate-700">
+              {worker.department || 'WORKER'}
+            </span>
+          </div>
+        </div>
+        <ChevronRight className="w-6 h-6 text-slate-400 group-hover:text-blue-300 transition-colors" />
+      </div>
+
+      <div className="mt-4 pt-3 border-t border-slate-700 grid grid-cols-4 gap-2 text-center">
+        <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
+          <p className="text-[11px] text-slate-400 font-bold uppercase whitespace-nowrap">Payable</p>
+          <p className="text-base font-extrabold text-emerald-300 font-mono mt-0.5 whitespace-nowrap">{p.payableDays || 0}d</p>
+        </div>
+        <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
+          <p className="text-[11px] text-blue-300 font-bold uppercase whitespace-nowrap">Wkday OT</p>
+          <p className="text-base font-extrabold text-blue-300 font-mono mt-0.5 whitespace-nowrap">{p.totalOtHours || 0}h</p>
+        </div>
+        <div className="bg-amber-950/60 border border-amber-600/50 p-2 rounded-xl">
+          <p className="text-[11px] text-amber-300 font-bold uppercase whitespace-nowrap">Sun OT ☀️</p>
+          <p className="text-base font-extrabold text-amber-300 font-mono mt-0.5 whitespace-nowrap">{p.totalSundayOtHours || 0}h</p>
+        </div>
+        {isPayrollUnlocked ? (
+          <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
+            <p className="text-[11px] text-slate-400 font-bold uppercase whitespace-nowrap">Net Pay</p>
+            <p className="text-sm font-extrabold text-white font-mono mt-0.5 whitespace-nowrap">₹{(p.netPayable || 0).toLocaleString('en-IN')}</p>
+          </div>
+        ) : (
+          <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
+            <p className="text-[11px] text-cyan-300 font-bold uppercase whitespace-nowrap">Total OT</p>
+            <p className="text-sm font-extrabold text-cyan-300 font-mono mt-0.5 whitespace-nowrap">{totalOtSum > 0 ? formatHours(totalOtSum) : '0h'}</p>
+          </div>
+        )}
+      </div>
+
+      <div className="mt-3 text-xs text-blue-400 font-bold flex items-center justify-end gap-1 group-hover:underline">
+        <span>View Daily Details</span>
+        <ArrowRight className="w-3.5 h-3.5" />
+      </div>
+    </div>
+  );
+});
+
+// Memoized Single Attendance Row in Worker Modal
+const WorkerAttendanceRow = React.memo(function WorkerAttendanceRow({
+  record,
+  index,
+  onEdit
+}) {
+  const r = record;
+  const isShort = (r.status || '').includes('Short');
+  const isAbsentOT = (r.status || '').includes('Absent (OT Credited)');
+  const isAbsent = (r.status || '').includes('Absent');
+  const isIncomplete = (r.status || '').includes('Incomplete');
+  const isWeeklyPaid = (r.status || '').includes('Weekly Off (Paid)');
+  const isWeeklyOT = (r.status || '').includes('Worked OT');
+
+  let statusBadge = (
+    <span className="px-2.5 py-1 rounded-lg bg-emerald-950 text-emerald-300 font-bold text-xs border border-emerald-600">
+      Present (Full)
+    </span>
+  );
+  if (isAbsentOT) {
+    statusBadge = (
+      <span className="px-2.5 py-1 rounded-lg bg-cyan-950 text-cyan-300 font-bold text-xs border border-cyan-500">
+        Absent (OT Credited)
+      </span>
+    );
+  } else if (isShort) {
+    statusBadge = (
+      <span className="px-2.5 py-1 rounded-lg bg-amber-950 text-amber-300 font-bold text-xs border border-amber-600">
+        Present (Short)
+      </span>
+    );
+  } else if (isAbsent) {
+    statusBadge = (
+      <span className="px-2.5 py-1 rounded-lg bg-rose-950 text-rose-300 font-bold text-xs border border-rose-600">
+        Absent
+      </span>
+    );
+  } else if (isIncomplete) {
+    statusBadge = (
+      <span className="px-2.5 py-1 rounded-lg bg-orange-950 text-orange-300 font-bold text-xs border border-orange-600">
+        Incomplete
+      </span>
+    );
+  } else if (isWeeklyOT) {
+    statusBadge = (
+      <span className="px-2.5 py-1 rounded-lg bg-amber-950 text-amber-300 font-bold text-xs border border-amber-600">
+        Weekly Off (Worked OT)
+      </span>
+    );
+  } else if (isWeeklyPaid) {
+    statusBadge = (
+      <span className="px-2.5 py-1 rounded-lg bg-blue-950 text-blue-300 font-bold text-xs border border-blue-600">
+        Weekly Off (Paid)
+      </span>
+    );
+  }
+
+  const isManual = r.is_manual_override === 1 || r.is_manual_override === true;
+
+  return (
+    <tr
+      className={`transition-colors divide-x divide-slate-800/80 ${
+        isManual
+          ? 'bg-violet-950/25 hover:bg-violet-900/35 border-l-4 border-l-violet-500'
+          : 'even:bg-slate-950/40 odd:bg-slate-900/60 hover:bg-slate-800/90'
+      }`}
+    >
+      <td className="py-3 px-4 font-mono font-bold text-white whitespace-nowrap">
+        <div className="flex items-center space-x-2">
+          <span>{r.date} <span className="text-slate-400 font-normal">({r.weekday || ''})</span></span>
+          {isManual && (
+            <span
+              className="px-2 py-0.5 rounded text-[10px] font-bold bg-violet-900/90 text-violet-200 border border-violet-500 flex items-center gap-1 shadow-sm"
+              title={r.override_reason || 'Manual Admin Correction'}
+            >
+              <Edit3 className="w-2.5 h-2.5 text-violet-300" />
+              <span>Manual Edit</span>
+            </span>
+          )}
+        </div>
+      </td>
+      <td className="py-3 px-4 font-mono text-slate-200">
+        {r.raw_swipes ? (
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {(() => {
+              const currentTokens = (r.raw_swipes || '').split(/\s+/).filter(Boolean);
+              const manualTokens = new Set((r.manual_punches || '').split(/\s+/).filter(Boolean));
+              const origTokens = new Set((r.original_raw_swipes || '').split(/\s+/).filter(Boolean));
+
+              return currentTokens.map((token, tokenIdx) => {
+                let isAddedTiming = false;
+                if (isManual) {
+                  if (manualTokens.has(token)) {
+                    isAddedTiming = true;
+                  } else if (origTokens.size > 0 && !origTokens.has(token)) {
+                    isAddedTiming = true;
+                  }
+                }
+
+                return (
+                  <span
+                    key={tokenIdx}
+                    className={`px-2 py-0.5 rounded-lg text-xs font-bold font-mono transition-all inline-flex items-center gap-1.5 ${
+                      isAddedTiming
+                        ? 'bg-sky-950/90 text-sky-200 border border-sky-400 font-bold shadow-sm shadow-sky-500/20 ring-1 ring-sky-400/40'
+                        : isManual
+                          ? 'bg-violet-950/80 text-violet-200 border border-violet-700/70'
+                          : 'bg-slate-950 text-cyan-300 border border-slate-700/80'
+                    }`}
+                    title={isAddedTiming ? `Manually Added Timing: ${token}` : `Biometric Punch: ${token}`}
+                  >
+                    {isAddedTiming && (
+                      <span className="w-1.5 h-1.5 rounded-full bg-sky-400 inline-block"></span>
+                    )}
+                    <span>{token}</span>
+                  </span>
+                );
+              });
+            })()}
+          </div>
+        ) : (
+          <span className="text-slate-500 italic text-xs">No Swipes</span>
+        )}
+      </td>
+      <td className="py-3 px-3 font-mono text-center whitespace-nowrap">
+        <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-teal-950/80 text-teal-300 border border-teal-700/60 shadow-sm">
+          {r.shift || '08:00'}
+        </span>
+      </td>
+      <td className="py-3 px-4 font-mono text-center text-emerald-300 font-bold whitespace-nowrap">
+        {r.effective_in || '—'}
+      </td>
+      <td className="py-3 px-4 font-mono text-center text-emerald-300 font-bold whitespace-nowrap">
+        {r.effective_out || '—'}
+      </td>
+      <td className="py-3 px-4 font-mono text-center text-slate-100 font-bold whitespace-nowrap">
+        {formatHours(r.regular_hours)}
+      </td>
+      <td className="py-3 px-4 font-mono text-center font-extrabold text-amber-300 whitespace-nowrap">
+        {r.ot_hours > 0 ? formatHours(r.ot_hours) : '0h'}
+      </td>
+      <td className="py-3 px-4 font-mono text-center text-rose-300 font-bold whitespace-nowrap">
+        {r.late_minutes > 0 ? `${r.late_minutes}m` : '0m'}
+      </td>
+      <td className="py-3 px-4 whitespace-nowrap">
+        {statusBadge}
+      </td>
+      <td className="py-3 px-4 text-right whitespace-nowrap">
+        {onEdit && (
+          <button
+            onClick={() => onEdit(r)}
+            className="p-2 rounded-lg bg-blue-900/60 text-blue-300 hover:bg-blue-800 border border-blue-700 cursor-pointer"
+            title="Edit Record"
+          >
+            <Edit2 className="w-4 h-4" />
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+});
+
 export default function Dashboard({
   metrics,
   allAttendance = [],
@@ -49,7 +284,8 @@ export default function Dashboard({
 }) {
   const [dragActive, setDragActive] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
-  const [selectedWorkerModal, setSelectedWorkerModal] = useState(null);
+  const deferredSearchTerm = React.useDeferredValue(searchTerm);
+  const [selectedWorkerStaffNo, setSelectedWorkerStaffNo] = useState(null);
   const [showExceptionModal, setShowExceptionModal] = useState(false);
 
   const exceptionWorkersCount = useMemo(() => {
@@ -85,22 +321,49 @@ export default function Dashboard({
     }
   };
 
-  // Filtered workers list
+  // Filtered workers list with deferredSearchTerm for 60fps butter-fast typing
   const filteredWorkers = useMemo(() => {
-    if (!searchTerm.trim()) return workers;
-    const term = searchTerm.toLowerCase();
+    if (!deferredSearchTerm.trim()) return workers;
+    const term = deferredSearchTerm.toLowerCase();
     return workers.filter(w =>
       String(w.staff_no).toLowerCase().includes(term) ||
       String(w.staff_name).toLowerCase().includes(term) ||
       (w.department || '').toLowerCase().includes(term)
     );
-  }, [workers, searchTerm]);
+  }, [workers, deferredSearchTerm]);
 
-  // Attendance for currently opened worker modal
+  // Pre-index allAttendance by staff_no for O(1) instant lookup
+  const attendanceByStaffMap = useMemo(() => {
+    const map = new Map();
+    for (let i = 0; i < allAttendance.length; i++) {
+      const r = allAttendance[i];
+      const s = String(r.staff_no);
+      let list = map.get(s);
+      if (!list) {
+        list = [];
+        map.set(s, list);
+      }
+      list.push(r);
+    }
+    return map;
+  }, [allAttendance]);
+
+  // Dynamic selectedWorkerModal that automatically stays fresh when worker updates
+  const selectedWorkerModal = useMemo(() => {
+    if (!selectedWorkerStaffNo) return null;
+    return workers.find(w => String(w.staff_no) === String(selectedWorkerStaffNo)) || null;
+  }, [workers, selectedWorkerStaffNo]);
+
+  // Attendance for currently opened worker modal (instant O(1) lookup + fallback to worker.dailyRecords)
   const selectedWorkerAttendance = useMemo(() => {
-    if (!selectedWorkerModal) return [];
-    return allAttendance.filter(r => String(r.staff_no) === String(selectedWorkerModal.staff_no));
-  }, [allAttendance, selectedWorkerModal]);
+    if (!selectedWorkerStaffNo) return [];
+    const fromMap = attendanceByStaffMap.get(String(selectedWorkerStaffNo));
+    if (fromMap && fromMap.length > 0) return fromMap;
+    if (selectedWorkerModal && Array.isArray(selectedWorkerModal.dailyRecords)) {
+      return selectedWorkerModal.dailyRecords;
+    }
+    return [];
+  }, [attendanceByStaffMap, selectedWorkerStaffNo, selectedWorkerModal]);
 
   return (
     <div className="space-y-6 animate-in fade-in duration-300 text-slate-100">
@@ -598,73 +861,14 @@ export default function Dashboard({
               No workers uploaded yet. Import an Excel or Word punch report above.
             </div>
           ) : (
-            filteredWorkers.map(w => {
-              const p = w.payroll || {};
-              const totalOtSum = (p.totalOtHours || 0) + (p.totalSundayOtHours || 0);
-
-              return (
-                <div
-                  key={w.staff_no}
-                  onClick={() => setSelectedWorkerModal(w)}
-                  className="p-5 rounded-2xl bg-slate-950 border-2 border-slate-700 hover:border-blue-400 hover:bg-slate-900 transition-all cursor-pointer group shadow-md"
-                >
-                  <div className="flex items-start justify-between">
-                    <div className="flex items-center space-x-3.5">
-                      <div className="px-3 py-2 rounded-xl bg-blue-950 text-cyan-300 border border-blue-700 font-mono font-bold text-base">
-                        #{w.staff_no}
-                      </div>
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <h4 className="text-base font-bold text-white group-hover:text-blue-300 transition-colors">
-                            {w.staff_name}
-                          </h4>
-                          {(w.is_exception === 1 || ['exempt', 'flexible', 'exception'].includes(w.assigned_shift)) && (
-                            <span className="text-[10px] px-1.5 py-0.2 rounded bg-amber-400 text-slate-950 font-black flex items-center gap-0.5">
-                              <Star className="w-2.5 h-2.5 fill-current" /> EXEMPT
-                            </span>
-                          )}
-                        </div>
-                        <span className="text-xs px-2.5 py-0.5 rounded bg-slate-800 text-slate-300 font-bold uppercase border border-slate-700">
-                          {w.department || 'WORKER'}
-                        </span>
-                      </div>
-                    </div>
-                    <ChevronRight className="w-6 h-6 text-slate-400 group-hover:text-blue-300 transition-colors" />
-                  </div>
-
-                  <div className="mt-4 pt-3 border-t border-slate-700 grid grid-cols-4 gap-2 text-center">
-                    <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
-                      <p className="text-[11px] text-slate-400 font-bold uppercase whitespace-nowrap">Payable</p>
-                      <p className="text-base font-extrabold text-emerald-300 font-mono mt-0.5 whitespace-nowrap">{p.payableDays || 0}d</p>
-                    </div>
-                    <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
-                      <p className="text-[11px] text-blue-300 font-bold uppercase whitespace-nowrap">Wkday OT</p>
-                      <p className="text-base font-extrabold text-blue-300 font-mono mt-0.5 whitespace-nowrap">{p.totalOtHours || 0}h</p>
-                    </div>
-                    <div className="bg-amber-950/60 border border-amber-600/50 p-2 rounded-xl">
-                      <p className="text-[11px] text-amber-300 font-bold uppercase whitespace-nowrap">Sun OT ☀️</p>
-                      <p className="text-base font-extrabold text-amber-300 font-mono mt-0.5 whitespace-nowrap">{p.totalSundayOtHours || 0}h</p>
-                    </div>
-                    {isPayrollUnlocked ? (
-                      <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
-                        <p className="text-[11px] text-slate-400 font-bold uppercase whitespace-nowrap">Net Pay</p>
-                        <p className="text-sm font-extrabold text-white font-mono mt-0.5 whitespace-nowrap">₹{(p.netPayable || 0).toLocaleString('en-IN')}</p>
-                      </div>
-                    ) : (
-                      <div className="bg-slate-900 p-2 rounded-xl border border-slate-800">
-                        <p className="text-[11px] text-cyan-300 font-bold uppercase whitespace-nowrap">Total OT</p>
-                        <p className="text-sm font-extrabold text-cyan-300 font-mono mt-0.5 whitespace-nowrap">{totalOtSum > 0 ? formatHours(totalOtSum) : '0h'}</p>
-                      </div>
-                    )}
-                  </div>
-
-                  <div className="mt-3 text-xs text-blue-400 font-bold flex items-center justify-end gap-1 group-hover:underline">
-                    <span>View Daily Details</span>
-                    <ArrowRight className="w-3.5 h-3.5" />
-                  </div>
-                </div>
-              );
-            })
+            filteredWorkers.map(w => (
+              <WorkerCard
+                key={w.staff_no}
+                worker={w}
+                isPayrollUnlocked={isPayrollUnlocked}
+                onSelect={(staffNo) => setSelectedWorkerStaffNo(staffNo)}
+              />
+            ))
           )}
         </div>
       </div>
@@ -705,7 +909,7 @@ export default function Dashboard({
                 </a>
 
                 <button
-                  onClick={() => setSelectedWorkerModal(null)}
+                  onClick={() => setSelectedWorkerStaffNo(null)}
                   className="p-2 rounded-xl text-slate-300 hover:text-white hover:bg-slate-800 transition-colors"
                 >
                   <X className="w-6 h-6" />
@@ -738,164 +942,16 @@ export default function Dashboard({
                       </td>
                     </tr>
                   ) : (
-                    selectedWorkerAttendance.map((r, idx) => {
-                      const isShort = r.status.includes('Short');
-                      const isAbsentOT = r.status.includes('Absent (OT Credited)');
-                      const isAbsent = r.status.includes('Absent');
-                      const isIncomplete = r.status.includes('Incomplete');
-                      const isWeeklyPaid = r.status.includes('Weekly Off (Paid)');
-                      const isWeeklyOT = r.status.includes('Worked OT');
-
-                      let statusBadge = (
-                        <span className="px-2.5 py-1 rounded-lg bg-emerald-950 text-emerald-300 font-bold text-xs border border-emerald-600">
-                          Present (Full)
-                        </span>
-                      );
-                      if (isAbsentOT) {
-                        statusBadge = (
-                          <span className="px-2.5 py-1 rounded-lg bg-cyan-950 text-cyan-300 font-bold text-xs border border-cyan-500">
-                            Absent (OT Credited)
-                          </span>
-                        );
-                      } else if (isShort) {
-                        statusBadge = (
-                          <span className="px-2.5 py-1 rounded-lg bg-amber-950 text-amber-300 font-bold text-xs border border-amber-600">
-                            Present (Short)
-                          </span>
-                        );
-                      } else if (isAbsent) {
-                        statusBadge = (
-                          <span className="px-2.5 py-1 rounded-lg bg-rose-950 text-rose-300 font-bold text-xs border border-rose-600">
-                            Absent
-                          </span>
-                        );
-                      } else if (isIncomplete) {
-                        statusBadge = (
-                          <span className="px-2.5 py-1 rounded-lg bg-orange-950 text-orange-300 font-bold text-xs border border-orange-600">
-                            Incomplete
-                          </span>
-                        );
-                      } else if (isWeeklyOT) {
-                        statusBadge = (
-                          <span className="px-2.5 py-1 rounded-lg bg-amber-950 text-amber-300 font-bold text-xs border border-amber-600">
-                            Weekly Off (Worked OT)
-                          </span>
-                        );
-                      } else if (isWeeklyPaid) {
-                        statusBadge = (
-                          <span className="px-2.5 py-1 rounded-lg bg-blue-950 text-blue-300 font-bold text-xs border border-blue-600">
-                            Weekly Off (Paid)
-                          </span>
-                        );
-                      }
-
-                      const isManual = r.is_manual_override === 1 || r.is_manual_override === true;
-
-                      return (
-                        <tr
-                          key={`${r.date}-${idx}`}
-                          className={`transition-colors divide-x divide-slate-800/80 ${isManual
-                              ? 'bg-violet-950/25 hover:bg-violet-900/35 border-l-4 border-l-violet-500'
-                              : 'even:bg-slate-950/40 odd:bg-slate-900/60 hover:bg-slate-800/90'
-                            }`}
-                        >
-                          <td className="py-3 px-4 font-mono font-bold text-white whitespace-nowrap">
-                            <div className="flex items-center space-x-2">
-                              <span>{r.date} <span className="text-slate-400 font-normal">({r.weekday || ''})</span></span>
-                              {isManual && (
-                                <span
-                                  className="px-2 py-0.5 rounded text-[10px] font-bold bg-violet-900/90 text-violet-200 border border-violet-500 flex items-center gap-1 shadow-sm"
-                                  title={r.override_reason || 'Manual Admin Correction'}
-                                >
-                                  <Edit3 className="w-2.5 h-2.5 text-violet-300" />
-                                  <span>Manual Edit</span>
-                                </span>
-                              )}
-                            </div>
-                          </td>
-                          <td className="py-3 px-4 font-mono text-slate-200">
-                            {r.raw_swipes ? (
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                {(() => {
-                                  const currentTokens = (r.raw_swipes || '').split(/\s+/).filter(Boolean);
-                                  const manualTokens = new Set((r.manual_punches || '').split(/\s+/).filter(Boolean));
-                                  const origTokens = new Set((r.original_raw_swipes || '').split(/\s+/).filter(Boolean));
-                                  
-                                  return currentTokens.map((token, tokenIdx) => {
-                                    let isAddedTiming = false;
-                                    if (isManual) {
-                                      if (manualTokens.has(token)) {
-                                        isAddedTiming = true;
-                                      } else if (origTokens.size > 0 && !origTokens.has(token)) {
-                                        isAddedTiming = true;
-                                      }
-                                    }
-
-                                    return (
-                                      <span
-                                        key={tokenIdx}
-                                        className={`px-2 py-0.5 rounded-lg text-xs font-bold font-mono transition-all inline-flex items-center gap-1.5 ${
-                                          isAddedTiming
-                                            ? 'bg-sky-950/90 text-sky-200 border border-sky-400 font-bold shadow-sm shadow-sky-500/20 ring-1 ring-sky-400/40'
-                                            : isManual
-                                              ? 'bg-violet-950/80 text-violet-200 border border-violet-700/70'
-                                              : 'bg-slate-950 text-cyan-300 border border-slate-700/80'
-                                        }`}
-                                        title={isAddedTiming ? `Manually Added Timing: ${token}` : `Biometric Punch: ${token}`}
-                                      >
-                                        {isAddedTiming && (
-                                          <span className="w-1.5 h-1.5 rounded-full bg-sky-400 inline-block"></span>
-                                        )}
-                                        <span>{token}</span>
-                                      </span>
-                                    );
-                                  });
-                                })()}
-                              </div>
-                            ) : (
-                              <span className="text-slate-500 italic text-xs">No Swipes</span>
-                            )}
-                          </td>
-                          <td className="py-3 px-3 font-mono text-center whitespace-nowrap">
-                            <span className="px-2 py-0.5 rounded text-[11px] font-bold bg-teal-950/80 text-teal-300 border border-teal-700/60 shadow-sm">
-                              {r.shift || '08:00'}
-                            </span>
-                          </td>
-                          <td className="py-3 px-4 font-mono text-center text-emerald-300 font-bold whitespace-nowrap">
-                            {r.effective_in || '—'}
-                          </td>
-                          <td className="py-3 px-4 font-mono text-center text-emerald-300 font-bold whitespace-nowrap">
-                            {r.effective_out || '—'}
-                          </td>
-                          <td className="py-3 px-4 font-mono text-center text-slate-100 font-bold whitespace-nowrap">
-                            {formatHours(r.regular_hours)}
-                          </td>
-                          <td className="py-3 px-4 font-mono text-center font-extrabold text-amber-300 whitespace-nowrap">
-                            {r.ot_hours > 0 ? formatHours(r.ot_hours) : '0h'}
-                          </td>
-                          <td className="py-3 px-4 font-mono text-center text-rose-300 font-bold whitespace-nowrap">
-                            {r.late_minutes > 0 ? `${r.late_minutes}m` : '0m'}
-                          </td>
-                          <td className="py-3 px-4 whitespace-nowrap">
-                            {statusBadge}
-                          </td>
-                          <td className="py-3 px-4 text-right whitespace-nowrap">
-                            {onEditRecord && (
-                              <button
-                                onClick={() => {
-                                  setSelectedWorkerModal(null);
-                                  onEditRecord(r);
-                                }}
-                                className="p-2 rounded-lg bg-blue-900/60 text-blue-300 hover:bg-blue-800 border border-blue-700"
-                                title="Edit Record"
-                              >
-                                <Edit2 className="w-4 h-4" />
-                              </button>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })
+                    selectedWorkerAttendance.map((r, idx) => (
+                      <WorkerAttendanceRow
+                        key={`${r.date}-${idx}`}
+                        record={r}
+                        index={idx}
+                        onEdit={(rec) => {
+                          if (onEditRecord) onEditRecord(rec);
+                        }}
+                      />
+                    ))
                   )}
                 </tbody>
               </table>
@@ -904,7 +960,7 @@ export default function Dashboard({
             {/* Modal Footer */}
             <div className="pt-3 border-t-2 border-slate-700 flex justify-end">
               <button
-                onClick={() => setSelectedWorkerModal(null)}
+                onClick={() => setSelectedWorkerStaffNo(null)}
                 className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-white text-sm font-bold rounded-xl border border-slate-600"
               >
                 Close View

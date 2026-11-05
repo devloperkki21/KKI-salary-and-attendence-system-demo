@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { 
   Search, 
   Download, 
@@ -30,6 +30,7 @@ export default function AllWorkersTable({
   selectedMonth
 }) {
   const [searchTerm, setSearchTerm] = useState('');
+  const deferredSearchTerm = React.useDeferredValue(searchTerm);
   const [editingStaffNo, setEditingStaffNo] = useState(null);
   const [editSalaryValue, setEditSalaryValue] = useState('');
   const [showSheetsModal, setShowSheetsModal] = useState(false);
@@ -65,12 +66,16 @@ export default function AllWorkersTable({
     }
   };
 
-  // Filter workers by search term
-  const filteredWorkers = (workers || []).filter(w => 
-    w.staff_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    w.staff_no.toString().includes(searchTerm) ||
-    (w.department || '').toLowerCase().includes(searchTerm.toLowerCase())
-  );
+  // Filter workers by deferred search term (60fps butter-fast typing)
+  const filteredWorkers = useMemo(() => {
+    if (!deferredSearchTerm.trim()) return workers || [];
+    const term = deferredSearchTerm.toLowerCase();
+    return (workers || []).filter(w => 
+      (w.staff_name || '').toLowerCase().includes(term) ||
+      String(w.staff_no || '').includes(term) ||
+      (w.department || '').toLowerCase().includes(term)
+    );
+  }, [workers, deferredSearchTerm]);
 
   const handleSaveSalary = (staffNo) => {
     if (editSalaryValue && !isNaN(editSalaryValue)) {

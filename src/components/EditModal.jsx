@@ -20,7 +20,7 @@ export default function EditModal({ record, staffNo, onSave, onCancel, loading }
     const normSwipes = normalizeTimeInput(rawSwipes);
 
     onSave({
-      staff_no: staffNo,
+      staff_no: staffNo || record.staff_no,
       date: record.date,
       raw_swipes: normSwipes,
       status,
@@ -30,7 +30,7 @@ export default function EditModal({ record, staffNo, onSave, onCancel, loading }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md">
       <div className="glass-modal w-full max-w-lg rounded-2xl p-6 shadow-2xl border border-slate-700/60 animate-in fade-in zoom-in duration-200">
         
         {/* Header */}

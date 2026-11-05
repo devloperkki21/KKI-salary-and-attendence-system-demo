@@ -307,6 +307,10 @@ async function initDatabase() {
     const schema = DB_SCHEMA || 'public';
     await querySupabaseDirect(`ALTER TABLE "${schema}".daily_attendance ADD COLUMN IF NOT EXISTS forfeiture_reason TEXT DEFAULT '';`);
     await querySupabaseDirect(`ALTER TABLE "${schema}".daily_attendance ADD COLUMN IF NOT EXISTS override_reason TEXT DEFAULT '';`);
+    await querySupabaseDirect(`CREATE INDEX IF NOT EXISTS idx_${schema}_da_date ON "${schema}".daily_attendance(date);`);
+    await querySupabaseDirect(`CREATE INDEX IF NOT EXISTS idx_${schema}_da_staff_date ON "${schema}".daily_attendance(staff_no, date);`);
+    await querySupabaseDirect(`CREATE INDEX IF NOT EXISTS idx_${schema}_rp_staff_date ON "${schema}".raw_punches(staff_no, date);`);
+    await querySupabaseDirect(`CREATE INDEX IF NOT EXISTS idx_${schema}_adv_staff_date ON "${schema}".advances(staff_no, date);`);
   } catch (e) {
     console.warn('Schema migration warning:', e.message);
   }
