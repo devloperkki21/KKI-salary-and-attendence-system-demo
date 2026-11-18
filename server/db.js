@@ -30,11 +30,12 @@ if (!/^[a-zA-Z0-9_]+$/.test(DB_SCHEMA)) {
   throw new Error(`Invalid DB_SCHEMA "${DB_SCHEMA}": only alphanumeric and underscore characters are allowed.`);
 }
 
-// Initialize official @supabase/supabase-js client when SUPABASE_URL + key are present
+// Initialize official @supabase/supabase-js client when SUPABASE_URL + key are present.
+// Always target PostgREST 'public' schema for RPC transport (PostgREST only exposes 'public' by default);
+// schema isolation ('public' vs 'demo') is enforced safely inside PostgreSQL via target_schema / search_path.
 let supabase = null;
 if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
   supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-    db: { schema: DB_SCHEMA },
     auth: { persistSession: false, autoRefreshToken: false }
   });
 }
@@ -429,7 +430,7 @@ async function getDatabaseStatus() {
 
   try {
     const counts = {};
-    if (supabase) {
+    if (supabase && DB_SCHEMA === 'public') {
       const results = await Promise.all(
         tables.map(async (t) => {
           const { count, error } = await supabase
