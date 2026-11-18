@@ -215,7 +215,7 @@ BEGIN
 
   trimmed_sql := btrim(regexp_replace(query_text, ';\s*$', ''));
 
-  IF trimmed_sql ~* '^\s*(SELECT|WITH|SHOW|VALUES)\b' OR trimmed_sql ~* '\bRETURNING\b' THEN
+  IF trimmed_sql ~* '^\s*(SELECT|WITH|SHOW|VALUES)\y' OR trimmed_sql ~* '\yRETURNING\y' THEN
     EXECUTE format('SELECT COALESCE(jsonb_agg(row_to_json(t)), ''[]''::jsonb) FROM (%s) t', trimmed_sql)
       INTO result_rows;
     RETURN COALESCE(result_rows, '[]'::jsonb);
