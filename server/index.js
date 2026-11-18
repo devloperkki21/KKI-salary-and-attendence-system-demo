@@ -4,26 +4,7 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 
-const { execute, batch, initDatabase, backupDatabaseToSeed, setCacheInvalidator } = require('./db');
-const {
-  queryCloud,
-  syncAttendanceToCloud,
-  syncRawPunchesToCloud,
-  syncSingleAttendanceToCloud,
-  syncAuditLogToCloud,
-  syncWorkerToCloud,
-  deleteWorkerFromCloud,
-  syncAdvanceToCloud,
-  deleteAdvanceFromCloud,
-  syncSettingToCloud,
-  syncCustomRuleToCloud,
-  deleteCustomRuleFromCloud,
-  syncSalaryRuleToCloud,
-  deleteSalaryRuleFromCloud,
-  syncCalendarToCloud,
-  deleteCalendarFromCloud,
-  getCloudStatus
-} = require('./cloudSync');
+const { execute, batch, initDatabase, getDatabaseStatus, setCacheInvalidator } = require('./db');
 const XLSX = require('xlsx');
 const { parseExcelFile, parseWordFile, parseSwipeRecord } = require('./parser');
 const {
@@ -59,14 +40,14 @@ app.use(cookieParser());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Global Authentication Middleware for API endpoints (Exempts /api/auth/*)
+// Strict Global Authentication Middleware for API endpoints (PUBLIC_API_PATHS allowlist only)
 app.use(async (req, res, next) => {
-  // Allow all /api/auth endpoints
-  if (req.path.startsWith('/api/auth')) {
-    return next();
-  }
   // Allow non-API endpoints (static frontend assets)
   if (!req.path.startsWith('/api')) {
+    return next();
+  }
+  // Allow ONLY explicitly whitelisted public paths
+  if (auth.PUBLIC_API_PATHS.has(req.path)) {
     return next();
   }
 
@@ -93,6 +74,10 @@ app.use(async (req, res, next) => {
   }
 
   req.authToken = token;
+  req.user = {
+    role: sessionCheck.role || 'admin',
+    token
+  };
   next();
 });
 
@@ -303,25 +288,7 @@ app.post('/api/custom-rules', async (req, res) => {
         resolvedGraceMins,
       ]
     );
-
-    syncCustomRuleToCloud({
-      rule_name,
-      rule_type,
-      target_staff_no: target_staff_no || 'all',
-      exemption_type: exemption_type || '',
-      start_time: start_time || '',
-      end_time: end_time || '',
-      threshold_mins: parseInt(threshold_mins, 10) || 0,
-      deduction_mins: parseInt(deduction_mins, 10) || 0,
-      deduction_amount: parseFloat(deduction_amount) || 0,
-      valid_from: valid_from || '',
-      valid_to: valid_to || '',
-      max_allowed_days: parseInt(max_allowed_days, 10) || 0,
-      grace_allowed_mins: resolvedGraceMins,
-      is_active: 1
-    }).catch(() => {});
-
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     await recomputeAllAttendance();
 
     res.json({ success: true, message: 'Custom rule created and payroll recomputed.' });
@@ -335,10 +302,7 @@ app.post('/api/custom-rules/:id/toggle', async (req, res) => {
   try {
     const { id } = req.params;
     await execute(`UPDATE custom_rules SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = ?`, [id]);
-    execute('SELECT * FROM custom_rules WHERE id = ?', [id]).then(r => {
-      if (r.rows && r.rows[0]) syncCustomRuleToCloud(r.rows[0]).catch(() => {});
-    }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     await recomputeAllAttendance();
     res.json({ success: true, message: 'Rule status toggled & payroll recomputed.' });
   } catch (err) {
@@ -351,8 +315,7 @@ app.delete('/api/custom-rules/:id', async (req, res) => {
   try {
     const { id } = req.params;
     await execute(`DELETE FROM custom_rules WHERE id = ?`, [id]);
-    deleteCustomRuleFromCloud(id).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     await recomputeAllAttendance();
     res.json({ success: true, message: 'Custom rule deleted & payroll recomputed.' });
   } catch (err) {
@@ -363,7 +326,7 @@ app.delete('/api/custom-rules/:id', async (req, res) => {
 // 1. GET Settings
 app.get('/api/settings', async (req, res) => {
   try {
-    const result = await execute(`SELECT * FROM settings`);
+    const result = await execute(`SELECT * FROM settings WHERE key NOT IN ('totp_secret', 'emergency_backup_codes')`);
     res.json({ success: true, settings: result.rows });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -371,18 +334,23 @@ app.get('/api/settings', async (req, res) => {
 });
 
 // 2. POST Settings (Update & Recompute)
-app.post('/api/settings', async (req, res) => {
+app.post('/api/settings', auth.authorize(['admin']), async (req, res) => {
   try {
     const newSettings = req.body; // { shift_start: '08:30', ... }
+    const BLOCKED_KEYS = new Set(['totp_secret', 'emergency_backup_codes']);
+    const stmts = [];
     for (const [key, value] of Object.entries(newSettings)) {
-      await execute(
-        `INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-        [key, String(value)]
-      );
-      syncSettingToCloud(key, String(value)).catch(() => {});
+      if (BLOCKED_KEYS.has(key)) continue;
+      stmts.push({
+        sql: `INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        args: [key, String(value)]
+      });
+    }
+    if (stmts.length > 0) {
+      await batch(stmts);
     }
 
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     // Recompute all records with new settings
     await recomputeAllAttendance();
@@ -407,7 +375,7 @@ app.get('/api/health', (req, res) => {
 
 app.get('/api/cloud-status', async (req, res) => {
   try {
-    const status = await getCloudStatus();
+    const status = await getDatabaseStatus();
     res.json(status);
   } catch (err) {
     res.status(500).json({ connected: false, error: err.message });
@@ -476,8 +444,11 @@ app.post('/api/auth/login', async (req, res) => {
     const { password, totpToken, backupCode } = req.body;
     const cfg = await auth.getAuthConfig();
 
-    // 1. Verify Master Password
-    if (!password || (password.trim() !== cfg.master_password.trim())) {
+    // 1. Verify Master Password strictly (zero hardcoded fallback)
+    if (!cfg.master_password) {
+      return res.status(503).json({ success: false, error: 'Server MASTER_PASSWORD is not configured in environment variables.' });
+    }
+    if (!auth.verifyPassword(password, cfg.master_password)) {
       return res.status(401).json({ success: false, error: 'Incorrect Master Admin Password! Please try again.' });
     }
 
@@ -550,13 +521,22 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// 2.2 POST Initialize 2FA Setup (Generate QR Code & Secret)
+// 2.2 POST Initialize 2FA Setup (First-time setup OR authenticated Admin only)
 app.post('/api/auth/setup/init', async (req, res) => {
   try {
     const { password } = req.body;
     const cfg = await auth.getAuthConfig();
 
-    if (!password || (password.trim() !== cfg.master_password.trim())) {
+    // If 2FA is already active, require a valid authenticated Admin session
+    if (cfg.totp_enabled && cfg.totp_secret) {
+      const token = auth.extractTokenFromReq(req);
+      const sessionCheck = await auth.validateSession(token);
+      if (!sessionCheck || !sessionCheck.valid || sessionCheck.role !== 'admin') {
+        return res.status(401).json({ success: false, error: '2FA is already active. Admin authentication required.' });
+      }
+    }
+
+    if (!cfg.master_password || !auth.verifyPassword(password, cfg.master_password)) {
       return res.status(401).json({ success: false, error: 'Incorrect Master Password! Cannot initialize 2FA.' });
     }
 
@@ -578,7 +558,16 @@ app.post('/api/auth/setup/confirm', async (req, res) => {
     const { password, secret, token } = req.body;
     const cfg = await auth.getAuthConfig();
 
-    if (!password || (password.trim() !== cfg.master_password.trim())) {
+    // If 2FA is already active, require a valid authenticated Admin session
+    if (cfg.totp_enabled && cfg.totp_secret) {
+      const sessToken = auth.extractTokenFromReq(req);
+      const sessionCheck = await auth.validateSession(sessToken);
+      if (!sessionCheck || !sessionCheck.valid || sessionCheck.role !== 'admin') {
+        return res.status(401).json({ success: false, error: '2FA is already active. Admin authentication required.' });
+      }
+    }
+
+    if (!cfg.master_password || !auth.verifyPassword(password, cfg.master_password)) {
       return res.status(401).json({ success: false, error: 'Incorrect Master Password!' });
     }
 
@@ -650,13 +639,13 @@ app.post('/api/auth/logout', async (req, res) => {
   }
 });
 
-// 2.5 POST Reset 2FA
-app.post('/api/auth/reset-2fa', async (req, res) => {
+// 2.5 POST Reset 2FA (Authenticated Admin only)
+app.post('/api/auth/reset-2fa', auth.authorize(['admin']), async (req, res) => {
   try {
     const { password, backupCode } = req.body;
     const cfg = await auth.getAuthConfig();
 
-    const isPasswordValid = password && (password.trim() === cfg.master_password.trim());
+    const isPasswordValid = auth.verifyPassword(password, cfg.master_password);
     let isBackupValid = false;
 
     if (backupCode && cfg.emergency_backup_codes) {
@@ -671,6 +660,7 @@ app.post('/api/auth/reset-2fa', async (req, res) => {
     await execute(`UPDATE settings SET value = 'false' WHERE key = 'totp_enabled'`);
     await execute(`UPDATE settings SET value = '' WHERE key = 'totp_secret'`);
     await execute(`UPDATE settings SET value = '[]' WHERE key = 'emergency_backup_codes'`);
+    auth.invalidateAuthConfigCache();
 
     res.json({ success: true, message: 'Google Authenticator 2FA has been reset. Please configure a new QR code.' });
   } catch (err) {
@@ -678,13 +668,13 @@ app.post('/api/auth/reset-2fa', async (req, res) => {
   }
 });
 
-// 2.6 POST Change Master Password
-app.post('/api/auth/change-password', async (req, res) => {
+// 2.6 POST Change Master Password (Authenticated Admin only)
+app.post('/api/auth/change-password', auth.authorize(['admin']), async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
     const cfg = await auth.getAuthConfig();
 
-    if (!currentPassword || currentPassword.trim() !== cfg.master_password.trim()) {
+    if (!auth.verifyPassword(currentPassword, cfg.master_password)) {
       return res.status(401).json({ success: false, error: 'Current password is incorrect!' });
     }
     if (!newPassword || newPassword.trim().length < 4) {
@@ -694,6 +684,7 @@ app.post('/api/auth/change-password', async (req, res) => {
     const cleanNew = newPassword.trim();
     await execute(`INSERT INTO settings (key, value, description) VALUES ('master_password', ?, 'Master Admin Password') ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [cleanNew]);
     await execute(`INSERT INTO settings (key, value, description) VALUES ('payroll_password', ?, 'Password to unlock salary and payroll figures') ON CONFLICT(key) DO UPDATE SET value = excluded.value`, [cleanNew]);
+    invalidateAppCache();
 
     res.json({ success: true, message: 'Password updated successfully!' });
   } catch (err) {
@@ -701,13 +692,13 @@ app.post('/api/auth/change-password', async (req, res) => {
   }
 });
 
-// 2.7 POST Regenerate Backup Codes
-app.post('/api/auth/regenerate-backup-codes', async (req, res) => {
+// 2.7 POST Regenerate Backup Codes (Authenticated Admin only)
+app.post('/api/auth/regenerate-backup-codes', auth.authorize(['admin']), async (req, res) => {
   try {
     const { password } = req.body;
     const cfg = await auth.getAuthConfig();
 
-    if (!password || password.trim() !== cfg.master_password.trim()) {
+    if (!auth.verifyPassword(password, cfg.master_password)) {
       return res.status(401).json({ success: false, error: 'Incorrect Master Password!' });
     }
 
@@ -726,14 +717,14 @@ app.post('/api/auth/regenerate-backup-codes', async (req, res) => {
   }
 });
 
-// 2.8 POST Verify Payroll Unlock Password (Secondary layer for Salary Mode)
-app.post('/api/auth/verify-payroll-password', async (req, res) => {
+// 2.8 POST Verify Payroll Unlock Password (Authenticated Admin secondary layer for Salary Mode)
+app.post('/api/auth/verify-payroll-password', auth.authorize(['admin']), async (req, res) => {
   try {
     const { password } = req.body;
-    const settings = await getSettingsMap();
-    const configuredPassword = settings.payroll_password || settings.master_password || 'kki123';
+    const cfg = await auth.getAuthConfig();
+    const configuredPassword = cfg.payroll_password || cfg.master_password;
 
-    if (password && password.trim() === configuredPassword.trim()) {
+    if (configuredPassword && auth.verifyPassword(password, configuredPassword)) {
       return res.json({ success: true, message: 'Password verified. Payroll unlocked.' });
     } else {
       return res.status(401).json({ success: false, error: 'Incorrect password! Please try again.' });
@@ -1009,10 +1000,7 @@ app.post('/api/upload', upload.single('file'), async (req, res) => {
     for (let i = 0; i < dbStatements.length; i += 500) {
       const chunk = dbStatements.slice(i, i + 500);
       await batch(chunk);
-    }
-
-    // Auto-backup to seed_data.json and rolling snapshots
-    await backupDatabaseToSeed();
+    }    invalidateAppCache();
 
     const sortedDates = Array.from(datesSet).sort();
     const startDate = sortedDates[0] || '';
@@ -1135,7 +1123,7 @@ app.post('/api/upload/commit', async (req, res) => {
       await batch(chunk);
     }
 
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     res.json({ success: true, message: `Successfully committed ${parsedData.length} workers to database.` });
   } catch (err) {
@@ -1143,8 +1131,8 @@ app.post('/api/upload/commit', async (req, res) => {
   }
 });
 
-// 4.1 POST Clear Attendance Logs by Date Range, Month, or Total Factory Reset
-app.post('/api/attendance/clear-range', async (req, res) => {
+// 4.1 POST Clear Attendance Logs by Date Range, Month, or Total Factory Reset (Atomic Admin-Only)
+app.post('/api/attendance/clear-range', auth.authorize(['admin']), async (req, res) => {
   try {
     const { startDate, endDate, month, clearAll } = req.body;
 
@@ -1152,22 +1140,16 @@ app.post('/api/attendance/clear-range', async (req, res) => {
       const countRes = await execute(`SELECT COUNT(*) as cnt FROM daily_attendance`);
       const deletedCount = countRes.rows[0]?.cnt || 0;
 
-      // Wipe all related tables for complete 100% clean factory reset
-      await execute(`DELETE FROM daily_attendance`);
-      await execute(`DELETE FROM raw_punches`);
-      await execute(`DELETE FROM workers`);
-      await execute(`DELETE FROM advances`);
-      await execute(`DELETE FROM audit_logs`);
+      // Atomic PostgreSQL transaction wipe (zero local disk, zero resurrection)
+      await batch([
+        `DELETE FROM daily_attendance`,
+        `DELETE FROM raw_punches`,
+        `DELETE FROM workers`,
+        `DELETE FROM advances`,
+        `DELETE FROM audit_logs`
+      ]);
 
-      queryCloud(`
-        DELETE FROM daily_attendance;
-        DELETE FROM raw_punches;
-        DELETE FROM workers;
-        DELETE FROM advances;
-        DELETE FROM audit_logs;
-      `).catch(() => {});
-
-      await backupDatabaseToSeed();
+      invalidateAppCache();
 
       return res.json({
         success: true,
@@ -1192,24 +1174,15 @@ app.post('/api/attendance/clear-range', async (req, res) => {
     const countRes = await execute(`SELECT COUNT(*) as cnt FROM daily_attendance WHERE ${deleteWhere}`, params);
     const deletedCount = countRes.rows[0]?.cnt || 0;
 
-    await execute(`DELETE FROM daily_attendance WHERE ${deleteWhere}`, params);
-    await execute(`DELETE FROM raw_punches WHERE ${deleteWhere}`, params);
-    await execute(`DELETE FROM advances WHERE ${deleteWhere}`, params);
+    // Atomic PostgreSQL transaction for date-range/month deletion
+    await batch([
+      { sql: `DELETE FROM daily_attendance WHERE ${deleteWhere}`, args: params },
+      { sql: `DELETE FROM raw_punches WHERE ${deleteWhere}`, args: params },
+      { sql: `DELETE FROM advances WHERE ${deleteWhere}`, args: params },
+      `DELETE FROM workers WHERE staff_no NOT IN (SELECT DISTINCT staff_no FROM daily_attendance)`
+    ]);
 
-    // Clean up orphaned worker profiles that have no attendance logs left
-    await execute(`DELETE FROM workers WHERE staff_no NOT IN (SELECT DISTINCT staff_no FROM daily_attendance)`);
-
-    const cloudWhere = startDate && endDate
-      ? `date >= '${startDate}' AND date <= '${endDate}'`
-      : `date LIKE '${month}%'`;
-    queryCloud(`
-      DELETE FROM daily_attendance WHERE ${cloudWhere};
-      DELETE FROM raw_punches WHERE ${cloudWhere};
-      DELETE FROM advances WHERE ${cloudWhere};
-      DELETE FROM workers WHERE staff_no NOT IN (SELECT DISTINCT staff_no FROM daily_attendance);
-    `).catch(() => {});
-
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     res.json({
       success: true,
@@ -1504,8 +1477,7 @@ app.post('/api/calendar/declare', async (req, res) => {
       // Revert date back to default schedule
       await execute(`DELETE FROM factory_calendar WHERE date = ?`, [date]);
       await execute(`DELETE FROM paid_holidays WHERE holiday_date = ?`, [date]);
-      deleteCalendarFromCloud(date).catch(() => {});
-      await backupDatabaseToSeed();
+      invalidateAppCache();
       await recomputeAllAttendance();
       return res.json({ success: true, message: `Schedule for ${date} reset to standard factory default.` });
     }
@@ -1533,9 +1505,7 @@ app.post('/api/calendar/declare', async (req, res) => {
     } else {
       await execute(`DELETE FROM paid_holidays WHERE holiday_date = ?`, [date]);
     }
-
-    syncCalendarToCloud({ date, day_type: cleanedType, title: cleanedTitle, notes: notes || '', is_recurring: is_recurring ? 1 : 0 }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     await recomputeAllAttendance();
     res.json({
       success: true,
@@ -1566,7 +1536,6 @@ app.post('/api/calendar/swap', async (req, res) => {
       [workDate, finalWorkTitle, finalReason]
     );
     await execute(`DELETE FROM paid_holidays WHERE holiday_date = ?`, [workDate]);
-    syncCalendarToCloud({ date: workDate, day_type: 'working_day', title: finalWorkTitle, notes: finalReason, is_recurring: 0 }).catch(() => {});
 
     // 2. Declare offDate as off_day
     await execute(
@@ -1576,9 +1545,8 @@ app.post('/api/calendar/swap', async (req, res) => {
       [offDate, finalOffTitle, finalReason]
     );
     await execute(`DELETE FROM paid_holidays WHERE holiday_date = ?`, [offDate]);
-    syncCalendarToCloud({ date: offDate, day_type: 'off_day', title: finalOffTitle, notes: finalReason, is_recurring: 0 }).catch(() => {});
 
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     await recomputeAllAttendance();
     res.json({
       success: true,
@@ -1599,9 +1567,8 @@ app.delete('/api/calendar/:id', async (req, res) => {
     await execute(`DELETE FROM factory_calendar WHERE id = ?`, [id]);
     if (targetDate) {
       await execute(`DELETE FROM paid_holidays WHERE holiday_date = ?`, [targetDate]);
-      deleteCalendarFromCloud(targetDate).catch(() => {});
     }
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     await recomputeAllAttendance();
     res.json({ success: true, message: 'Schedule override removed & attendance recomputed.' });
   } catch (err) {
@@ -1615,8 +1582,7 @@ app.delete('/api/calendar/date/:date', async (req, res) => {
     const { date } = req.params;
     await execute(`DELETE FROM factory_calendar WHERE date = ?`, [date]);
     await execute(`DELETE FROM paid_holidays WHERE holiday_date = ?`, [date]);
-    deleteCalendarFromCloud(date).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     await recomputeAllAttendance();
     res.json({ success: true, message: `Schedule for ${date} reset to standard factory default.` });
   } catch (err) {
@@ -1936,11 +1902,7 @@ app.post('/api/workers/:staff_no/profile', async (req, res) => {
         staff_no
       ]
     );
-
-    execute('SELECT * FROM workers WHERE staff_no = ?', [staff_no]).then(w => {
-      if (w.rows && w.rows[0]) syncWorkerToCloud(w.rows[0]).catch(() => {});
-    }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     // Recompute attendance for this worker
     await recomputeAllAttendance();
@@ -1969,15 +1931,11 @@ app.post('/api/workers/:staff_no/toggle-exception', async (req, res) => {
       `UPDATE workers SET is_exception = ?, exception_reason = ? WHERE staff_no = ?`,
       [targetException, reason, staff_no]
     );
-
-    execute('SELECT * FROM workers WHERE staff_no = ?', [staff_no]).then(w => {
-      if (w.rows && w.rows[0]) syncWorkerToCloud(w.rows[0]).catch(() => {});
-    }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     await execute(
       `INSERT INTO audit_logs (staff_no, date, field_changed, old_value, new_value, edited_by, reason)
-       VALUES (?, date('now'), 'Exception Status', ?, ?, 'Admin', ?)`,
+       VALUES (?, CURRENT_DATE::text, 'Exception Status', ?, ?, 'Admin', ?)`,
       [staff_no, targetException === 1 ? 'Standard Worker' : 'Exception Worker', targetException === 1 ? 'Exception Worker' : 'Standard Worker', reason]
     );
 
@@ -2008,16 +1966,13 @@ app.post('/api/workers/batch-exception', async (req, res) => {
         `UPDATE workers SET is_exception = ?, exception_reason = ? WHERE staff_no = ?`,
         [flag, reason, String(sNo)]
       );
-      execute('SELECT * FROM workers WHERE staff_no = ?', [String(sNo)]).then(w => {
-        if (w.rows && w.rows[0]) syncWorkerToCloud(w.rows[0]).catch(() => {});
-      }).catch(() => {});
       await execute(
         `INSERT INTO audit_logs (staff_no, date, field_changed, old_value, new_value, edited_by, reason)
-         VALUES (?, date('now'), 'Exception Status', ?, ?, 'Admin', ?)`,
+         VALUES (?, CURRENT_DATE::text, 'Exception Status', ?, ?, 'Admin', ?)`,
         [String(sNo), flag === 1 ? 'Standard Worker' : 'Exception Worker', flag === 1 ? 'Exception Worker' : 'Standard Worker', reason]
       );
     }
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     res.json({
       success: true,
@@ -2066,11 +2021,7 @@ app.post('/api/workers/:staff_no/compensation', async (req, res) => {
         staff_no
       ]
     );
-
-    execute('SELECT * FROM workers WHERE staff_no = ?', [staff_no]).then(w => {
-      if (w.rows && w.rows[0]) syncWorkerToCloud(w.rows[0]).catch(() => {});
-    }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     res.json({ success: true, message: 'Worker base salary & allowances updated.' });
   } catch (err) {
@@ -2942,7 +2893,7 @@ async function warmCacheOnStartup() {
 }
 
 // 11. POST Google Sheets Live Sync (OPTIMIZED)
-app.post('/api/google-sheets/sync', async (req, res) => {
+app.post('/api/google-sheets/sync', auth.authorize(['admin']), async (req, res) => {
   try {
     const { webhook_url, month } = req.body;
     if (!webhook_url) {
@@ -3073,7 +3024,7 @@ function formatAndAutoFitWorksheet(worksheet, dataAoA) {
 }
 
 // 12. GET Export Full Factory Attendance & Payroll Excel Sheet (Professional Styling, optional ?month=YYYY-MM, ?payroll_unlocked=true)
-app.get('/api/export/excel', async (req, res) => {
+app.get('/api/export/excel', auth.authorize(['admin']), async (req, res) => {
   try {
     const { month } = req.query;
     const isPayrollUnlocked = req.query.payroll_unlocked === 'true' || req.query.is_payroll_unlocked === 'true' || req.query.unlocked === 'true';
@@ -3177,7 +3128,7 @@ app.get('/api/export/excel', async (req, res) => {
 });
 
 // 12b. GET Export Dedicated Daily Biometric Timings Excel Sheet (optional ?month=YYYY-MM, ?payroll_unlocked=true)
-app.get('/api/export/excel/timings', async (req, res) => {
+app.get('/api/export/excel/timings', auth.authorize(['admin']), async (req, res) => {
   try {
     const { month } = req.query;
     const isPayrollUnlocked = req.query.payroll_unlocked === 'true' || req.query.is_payroll_unlocked === 'true' || req.query.unlocked === 'true';
@@ -3224,7 +3175,7 @@ app.get('/api/export/excel/timings', async (req, res) => {
 });
 
 // 12c. GET Export Concise 5-Column Executive Attendance & Overtime Report (optional ?month=YYYY-MM, ?payroll_unlocked=true)
-app.get('/api/export/excel/summary', async (req, res) => {
+app.get('/api/export/excel/summary', auth.authorize(['admin']), async (req, res) => {
   try {
     const { month } = req.query;
     const isPayrollUnlocked = req.query.payroll_unlocked === 'true' || req.query.is_payroll_unlocked === 'true' || req.query.unlocked === 'true';
@@ -3301,7 +3252,7 @@ app.get('/api/export/excel/summary', async (req, res) => {
 });
 
 // 12d. GET Export Deducted Holidays & Forfeited Offs Report (optional ?month=YYYY-MM, ?payroll_unlocked=true)
-app.get('/api/export/excel/deducted-holidays-and-offs', async (req, res) => {
+app.get('/api/export/excel/deducted-holidays-and-offs', auth.authorize(['admin']), async (req, res) => {
   try {
     const { month } = req.query;
     const isPayrollUnlocked = req.query.payroll_unlocked === 'true' || req.query.is_payroll_unlocked === 'true' || req.query.unlocked === 'true';
@@ -3385,7 +3336,7 @@ app.get('/api/export/excel/deducted-holidays-and-offs', async (req, res) => {
 });
 
 // 12e. GET Export Paid Holidays & Off-Days Worked Report (optional ?month=YYYY-MM, ?payroll_unlocked=true)
-app.get('/api/export/excel/paid-holidays-and-off-duty', async (req, res) => {
+app.get('/api/export/excel/paid-holidays-and-off-duty', auth.authorize(['admin']), async (req, res) => {
   try {
     const { month } = req.query;
     const isPayrollUnlocked = req.query.payroll_unlocked === 'true' || req.query.is_payroll_unlocked === 'true' || req.query.unlocked === 'true';
@@ -3469,7 +3420,7 @@ app.get('/api/export/excel/paid-holidays-and-off-duty', async (req, res) => {
 });
 
 // 12f. GET Export Dedicated Fixes & Manual Edits Audit Report (optional ?month=YYYY-MM, ?payroll_unlocked=true)
-app.get('/api/export/excel/fixes-audit', async (req, res) => {
+app.get('/api/export/excel/fixes-audit', auth.authorize(['admin']), async (req, res) => {
   try {
     const { month } = req.query;
     const isPayrollUnlocked = req.query.payroll_unlocked === 'true' || req.query.is_payroll_unlocked === 'true' || req.query.unlocked === 'true';
@@ -3554,7 +3505,7 @@ app.get('/api/export/excel/fixes-audit', async (req, res) => {
 });
 
 // 13. GET Export Single Worker Excel Sheet (optional ?month=YYYY-MM, ?payroll_unlocked=true)
-app.get('/api/export/excel/worker/:staff_no', async (req, res) => {
+app.get('/api/export/excel/worker/:staff_no', auth.authorize(['admin']), async (req, res) => {
   try {
     const { staff_no } = req.params;
     const { month } = req.query;
@@ -3712,11 +3663,7 @@ app.post('/api/salary-rules', async (req, res) => {
         ai_original_prompt,
       ]
     );
-
-    execute('SELECT * FROM custom_salary_rules WHERE rule_name = ?', [rule_name]).then(r => {
-      if (r.rows && r.rows[0]) syncSalaryRuleToCloud(r.rows[0]).catch(() => {});
-    }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
 
     res.json({ success: true, message: `Salary rule "${rule_name}" created successfully.` });
   } catch (err) {
@@ -3729,10 +3676,7 @@ app.post('/api/salary-rules/:id/toggle', async (req, res) => {
   try {
     const { id } = req.params;
     await execute(`UPDATE custom_salary_rules SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE id = ?`, [id]);
-    execute('SELECT * FROM custom_salary_rules WHERE id = ?', [id]).then(r => {
-      if (r.rows && r.rows[0]) syncSalaryRuleToCloud(r.rows[0]).catch(() => {});
-    }).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     res.json({ success: true, message: 'Salary rule toggled.' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -3744,8 +3688,7 @@ app.delete('/api/salary-rules/:id', async (req, res) => {
   try {
     const { id } = req.params;
     await execute(`DELETE FROM custom_salary_rules WHERE id = ?`, [id]);
-    deleteSalaryRuleFromCloud(id).catch(() => {});
-    await backupDatabaseToSeed();
+    invalidateAppCache();
     res.json({ success: true, message: 'Salary rule deleted.' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -3940,7 +3883,7 @@ app.post('/api/ai-assistant/execute', async (req, res) => {
 });
 
 // 12b. POST AI Assistant - Generate Excel Report
-app.post('/api/ai-assistant/generate-report', async (req, res) => {
+app.post('/api/ai-assistant/generate-report', auth.authorize(['admin']), async (req, res) => {
   try {
     const { filterCriteria, reportTitle } = req.body;
 

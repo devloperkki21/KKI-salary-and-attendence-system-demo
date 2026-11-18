@@ -7,28 +7,25 @@ const ISSUER_NAME = 'KKI Attendance & Payroll';
 const ACCOUNT_LABEL = 'Admin';
 const SESSION_COOKIE_NAME = 'kki_session';
 
-// Permanent stable Base32 Secret & Emergency Backup Codes (Configured via Render Environment Variables)
-const DEFAULT_PERMANENT_TOTP_SECRET = process.env.TOTP_SECRET || 'SLFRTE6JFYKYRJV3NFPSEN7576NKOHAF';
-const DEFAULT_BACKUP_CODES = [
-  '1942-8371',
-  '5820-4916',
-  '7301-6542',
-  '8492-3105',
-  '6219-5840',
-  '3951-7284',
-  '4816-9203',
-  '9035-1678'
-];
+// Strict allowlist of unauthenticated API endpoints (all other /api/* routes require valid session)
+const PUBLIC_API_PATHS = new Set([
+  '/api/health',
+  '/api/auth/status',
+  '/api/auth/login',
+  '/api/auth/logout',
+  '/api/auth/setup/init',
+  '/api/auth/setup/confirm'
+]);
 
 // Security Policy: Forced absolute logout after 30 minutes, idle logout after 5 minutes
-const FORCED_LOGOUT_MINUTES = 30; // 30 minutes absolute session lifetime
-const INACTIVITY_TIMEOUT_MINUTES = 5; // 5 minutes inactivity timeout
-const SESSION_MAX_AGE_MS = FORCED_LOGOUT_MINUTES * 60 * 1000; // 1,800,000 ms
-const INACTIVITY_TIMEOUT_MS = INACTIVITY_TIMEOUT_MINUTES * 60 * 1000; // 300,000 ms
-const SESSION_EXPIRY_DAYS = FORCED_LOGOUT_MINUTES / (24 * 60); // backward-compatible alias
+const FORCED_LOGOUT_MINUTES = 30;
+const INACTIVITY_TIMEOUT_MINUTES = 5;
+const SESSION_MAX_AGE_MS = FORCED_LOGOUT_MINUTES * 60 * 1000;
+const INACTIVITY_TIMEOUT_MS = INACTIVITY_TIMEOUT_MINUTES * 60 * 1000;
+const SESSION_EXPIRY_DAYS = FORCED_LOGOUT_MINUTES / (24 * 60);
 
 // In-memory cache for validated sessions and auth config (eliminates high-latency roundtrips)
-const sessionCache = new Map(); // token -> { expiresTime, createdAtTime, lastActivityTime, cachedAt }
+const sessionCache = new Map(); // token -> { role, expiresTime, createdAtTime, lastActivityTime, cachedAt }
 const SESSION_CACHE_TTL_MS = 15000; // 15 seconds memory cache
 let cachedAuthConfig = null;
 let authConfigExpiresAt = 0;
@@ -39,7 +36,22 @@ function invalidateAuthConfigCache() {
 }
 
 /**
- * Fetch authentication configuration from DB
+ * Constant-time exact password verification (ZERO universal/backdoor passwords)
+ */
+function verifyPassword(candidate, expected) {
+  if (typeof candidate !== 'string' || typeof expected !== 'string') return false;
+  const a = candidate.trim();
+  const b = expected.trim();
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+/**
+ * Fetch authentication configuration strictly from Supabase settings + process.env
+ * (ZERO hardcoded password or TOTP secret fallbacks)
  */
 async function getAuthConfig() {
   const now = Date.now();
@@ -50,25 +62,28 @@ async function getAuthConfig() {
   const res = await execute(
     `SELECT key, value FROM settings WHERE key IN ('master_password', 'payroll_password', 'totp_enabled', 'totp_secret', 'emergency_backup_codes')`
   );
+
   const cfg = {
-    master_password: process.env.MASTER_PASSWORD || 'kki123',
-    totp_enabled: true,
-    totp_secret: process.env.TOTP_SECRET || DEFAULT_PERMANENT_TOTP_SECRET,
+    master_password: (process.env.MASTER_PASSWORD || '').trim() || null,
+    payroll_password: (process.env.PAYROLL_PASSWORD || '').trim() || null,
+    totp_enabled: false,
+    totp_secret: (process.env.TOTP_SECRET || '').trim() || '',
     emergency_backup_codes: []
   };
 
   res.rows.forEach(r => {
-    if (r.key === 'master_password') cfg.master_password = r.value || 'kki123';
-    else if (r.key === 'payroll_password' && (!cfg.master_password || cfg.master_password === 'kki123')) {
-      cfg.master_password = r.value || 'kki123';
+    if (r.key === 'master_password' && r.value && r.value.trim()) {
+      cfg.master_password = r.value.trim();
+    } else if (r.key === 'payroll_password' && r.value && r.value.trim()) {
+      cfg.payroll_password = r.value.trim();
     } else if (r.key === 'totp_enabled') {
-      cfg.totp_enabled = r.value !== 'false';
-    } else if (r.key === 'totp_secret') {
-      if (r.value && r.value.trim()) cfg.totp_secret = r.value.trim();
+      cfg.totp_enabled = r.value === 'true';
+    } else if (r.key === 'totp_secret' && r.value && r.value.trim()) {
+      cfg.totp_secret = r.value.trim();
     } else if (r.key === 'emergency_backup_codes') {
       try {
         const parsed = JSON.parse(r.value || '[]');
-        if (Array.isArray(parsed) && parsed.length > 0) {
+        if (Array.isArray(parsed)) {
           cfg.emergency_backup_codes = parsed;
         }
       } catch (e) {
@@ -77,18 +92,12 @@ async function getAuthConfig() {
     }
   });
 
-  // Ensure permanent TOTP secret and 2FA are always enabled
-  if (!cfg.totp_secret || !cfg.totp_secret.trim()) {
-    cfg.totp_secret = DEFAULT_PERMANENT_TOTP_SECRET;
-  }
-  cfg.totp_enabled = true;
-
-  // Ensure emergency backup codes are populated
-  if (!cfg.emergency_backup_codes || cfg.emergency_backup_codes.length === 0) {
-    cfg.emergency_backup_codes = DEFAULT_BACKUP_CODES.map(hashBackupCode);
+  // Fallback master_password to payroll_password only if saved in DB
+  if (!cfg.master_password && cfg.payroll_password) {
+    cfg.master_password = cfg.payroll_password;
   }
 
-  // Environment Variable Overrides (Guarantees persistence across Render ephemeral container redeployments)
+  // Explicit Environment Variable overrides take precedence over DB values
   if (process.env.TOTP_SECRET && process.env.TOTP_SECRET.trim()) {
     cfg.totp_secret = process.env.TOTP_SECRET.trim();
     cfg.totp_enabled = true;
@@ -96,22 +105,29 @@ async function getAuthConfig() {
   if (process.env.MASTER_PASSWORD && process.env.MASTER_PASSWORD.trim()) {
     cfg.master_password = process.env.MASTER_PASSWORD.trim();
   }
+  if (process.env.PAYROLL_PASSWORD && process.env.PAYROLL_PASSWORD.trim()) {
+    cfg.payroll_password = process.env.PAYROLL_PASSWORD.trim();
+  }
+
+  if (cfg.totp_secret) {
+    cfg.totp_enabled = true;
+  }
 
   cachedAuthConfig = { ...cfg };
-  authConfigExpiresAt = now + 60000; // 60s cache
+  authConfigExpiresAt = now + 60000;
   return cfg;
 }
 
 /**
- * Generate TOTP secret & QR Code Data URL (Defaults to permanent secret)
+ * Generate TOTP secret & QR Code Data URL (generates cryptographically random secret if none configured)
  */
 async function generateTotpSetup(customSecret = null) {
   const cfg = await getAuthConfig();
-  const secret = customSecret || cfg.totp_secret || DEFAULT_PERMANENT_TOTP_SECRET;
+  const secret = customSecret || cfg.totp_secret || generateSecret();
   const uri = generateURI({
     issuer: ISSUER_NAME,
     label: ACCOUNT_LABEL,
-    secret: secret
+    secret
   });
 
   const qrCodeUrl = await qrcode.toDataURL(uri, {
@@ -128,7 +144,7 @@ async function generateTotpSetup(customSecret = null) {
 
 /**
  * Verify a 6-digit TOTP token against a secret
- * window: 2 allows +/- 60s clock drift (2.5m window)
+ * window: 2 allows +/- 60s clock drift
  */
 function verifyTotpToken(token, secret) {
   if (!token || !secret) return false;
@@ -143,14 +159,13 @@ function verifyTotpToken(token, secret) {
 }
 
 /**
- * Generate 8 human-readable emergency backup codes
- * e.g. "4921-8302"
+ * Generate 8 cryptographically random human-readable emergency backup codes
  */
 function generateBackupCodes(count = 8) {
   const codes = [];
   for (let i = 0; i < count; i++) {
-    const part1 = Math.floor(1000 + Math.random() * 9000);
-    const part2 = Math.floor(1000 + Math.random() * 9000);
+    const part1 = crypto.randomInt(1000, 10000);
+    const part2 = crypto.randomInt(1000, 10000);
     codes.push(`${part1}-${part2}`);
   }
   return codes;
@@ -180,39 +195,53 @@ async function verifyAndConsumeBackupCode(rawCode, hashedCodesList) {
        ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
       [JSON.stringify(remaining)]
     );
+    invalidateAuthConfigCache();
     return { valid: true, remainingCodes: remaining };
   }
   return { valid: false, remainingCodes: hashedCodesList };
 }
 
 /**
- * Create a new user session in SQLite with 30-min absolute expiry and inactivity tracking
+ * Create a new authenticated user session directly in Supabase PostgreSQL
  */
-async function createSession() {
+async function createSession(role = 'admin') {
   const token = crypto.randomBytes(32).toString('hex');
   const now = new Date();
   const createdAt = now.toISOString();
   const expiresAt = new Date(now.getTime() + SESSION_MAX_AGE_MS).toISOString();
   const lastActivityAt = createdAt;
+  const normalizedRole = String(role || 'admin').toLowerCase();
 
-  await execute(
-    `INSERT INTO user_sessions (token, created_at, expires_at, last_activity_at) VALUES (?, ?, ?, ?)`,
-    [token, createdAt, expiresAt, lastActivityAt]
-  );
+  try {
+    await execute(
+      `INSERT INTO user_sessions (token, role, created_at, expires_at, last_activity_at) VALUES (?, ?, ?, ?, ?)`,
+      [token, normalizedRole, createdAt, expiresAt, lastActivityAt]
+    );
+  } catch (err) {
+    // Graceful fallback if target DB hasn't added the 'role' column yet
+    if (err.message && err.message.includes('role')) {
+      await execute(
+        `INSERT INTO user_sessions (token, created_at, expires_at, last_activity_at) VALUES (?, ?, ?, ?)`,
+        [token, createdAt, expiresAt, lastActivityAt]
+      );
+    } else {
+      throw err;
+    }
+  }
 
   sessionCache.set(token, {
+    role: normalizedRole,
     expiresTime: now.getTime() + SESSION_MAX_AGE_MS,
     createdAtTime: now.getTime(),
     lastActivityTime: now.getTime(),
     cachedAt: Date.now()
   });
 
-  return { token, createdAt, expiresAt, lastActivityAt };
+  return { token, role: normalizedRole, createdAt, expiresAt, lastActivityAt };
 }
 
 /**
  * Validate session token checking both 30-min forced ceiling and 5-min inactivity timeout.
- * Returns { valid: boolean, reason?: 'invalid' | 'session_timeout' | 'inactivity', remainingSessionMs?: number, remainingIdleMs?: number }
  */
 async function validateSession(token) {
   if (!token) return { valid: false, reason: 'invalid' };
@@ -220,7 +249,6 @@ async function validateSession(token) {
     const now = Date.now();
     const cached = sessionCache.get(token);
 
-    // Fast-path: return immediately from in-memory cache if checked within TTL
     if (cached && (now - cached.cachedAt < SESSION_CACHE_TTL_MS)) {
       if (now >= cached.expiresTime) {
         sessionCache.delete(token);
@@ -235,21 +263,36 @@ async function validateSession(token) {
       }
       return {
         valid: true,
+        role: cached.role || 'admin',
         remainingSessionMs: Math.max(0, cached.expiresTime - now),
         remainingIdleMs: Math.max(0, INACTIVITY_TIMEOUT_MS - idleElapsedMs)
       };
     }
 
-    const res = await execute(
-      `SELECT token, created_at, expires_at, last_activity_at FROM user_sessions WHERE token = ?`,
-      [token]
-    );
+    let res;
+    try {
+      res = await execute(
+        `SELECT token, role, created_at, expires_at, last_activity_at FROM user_sessions WHERE token = ?`,
+        [token]
+      );
+    } catch (colErr) {
+      if (colErr.message && colErr.message.includes('role')) {
+        res = await execute(
+          `SELECT token, created_at, expires_at, last_activity_at FROM user_sessions WHERE token = ?`,
+          [token]
+        );
+      } else {
+        throw colErr;
+      }
+    }
+
     if (!res.rows || res.rows.length === 0) {
       sessionCache.delete(token);
       return { valid: false, reason: 'invalid' };
     }
 
     const session = res.rows[0];
+    const role = (session.role || 'admin').toLowerCase();
 
     const parseDbDate = (val) => {
       if (!val) return null;
@@ -265,14 +308,12 @@ async function validateSession(token) {
     const createdAtTime = parseDbDate(session.created_at) || now;
     const lastActivityTime = parseDbDate(session.last_activity_at) || createdAtTime;
 
-    // Check 1: 30-minute absolute forced session ceiling
     if (now >= expiresTime) {
       sessionCache.delete(token);
       await destroySession(token);
       return { valid: false, reason: 'session_timeout' };
     }
 
-    // Check 2: 5-minute idle inactivity timeout
     const idleElapsedMs = now - lastActivityTime;
     if (idleElapsedMs >= INACTIVITY_TIMEOUT_MS) {
       sessionCache.delete(token);
@@ -280,7 +321,6 @@ async function validateSession(token) {
       return { valid: false, reason: 'inactivity' };
     }
 
-    // Touch last_activity_at asynchronously if > 15 seconds have elapsed since last write
     if (idleElapsedMs > 15000) {
       const currentIso = new Date().toISOString();
       execute(
@@ -289,21 +329,19 @@ async function validateSession(token) {
       ).catch(err => console.error('Failed to update session activity:', err.message));
     }
 
-    // Store in hot session cache
     sessionCache.set(token, {
+      role,
       expiresTime,
       createdAtTime,
       lastActivityTime: Math.max(lastActivityTime, now),
       cachedAt: now
     });
 
-    const remainingSessionMs = Math.max(0, expiresTime - now);
-    const remainingIdleMs = Math.max(0, INACTIVITY_TIMEOUT_MS - idleElapsedMs);
-
     return {
       valid: true,
-      remainingSessionMs,
-      remainingIdleMs
+      role,
+      remainingSessionMs: Math.max(0, expiresTime - now),
+      remainingIdleMs: Math.max(0, INACTIVITY_TIMEOUT_MS - idleElapsedMs)
     };
   } catch (err) {
     console.error('Validate session error:', err.message);
@@ -328,16 +366,13 @@ async function destroySession(token) {
  * Extract token from request (cookies or Authorization header)
  */
 function extractTokenFromReq(req) {
-  // Check cookie
   if (req.cookies && req.cookies[SESSION_COOKIE_NAME]) {
     return req.cookies[SESSION_COOKIE_NAME];
   }
-  // Check raw cookie header if cookie-parser is not active
   if (req.headers && req.headers.cookie) {
     const match = req.headers.cookie.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE_NAME}=([^;]+)`));
     if (match) return decodeURIComponent(match[1]);
   }
-  // Check Authorization Bearer header
   const authHeader = req.headers && (req.headers.authorization || req.headers['x-auth-token']);
   if (authHeader) {
     if (authHeader.startsWith('Bearer ')) return authHeader.substring(7).trim();
@@ -346,15 +381,40 @@ function extractTokenFromReq(req) {
   return null;
 }
 
+/**
+ * Role-Based Authorization Middleware (e.g., authorize(['admin']))
+ * Ensures non-admin roles cannot access admin-only Excel/CSV exports or destructive operations.
+ */
+function authorize(allowedRoles = ['admin']) {
+  const allowed = new Set(allowedRoles.map(r => String(r).toLowerCase()));
+  return (req, res, next) => {
+    if (!req.user || !req.user.role) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required.',
+        code: 'UNAUTHORIZED'
+      });
+    }
+    if (!allowed.has(String(req.user.role).toLowerCase())) {
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden: Admin access is required for this operation.',
+        code: 'FORBIDDEN_ADMIN_ONLY'
+      });
+    }
+    return next();
+  };
+}
+
 module.exports = {
   SESSION_COOKIE_NAME,
+  PUBLIC_API_PATHS,
   FORCED_LOGOUT_MINUTES,
   INACTIVITY_TIMEOUT_MINUTES,
   SESSION_MAX_AGE_MS,
   INACTIVITY_TIMEOUT_MS,
   SESSION_EXPIRY_DAYS,
-  DEFAULT_PERMANENT_TOTP_SECRET,
-  DEFAULT_BACKUP_CODES,
+  verifyPassword,
   getAuthConfig,
   generateTotpSetup,
   verifyTotpToken,
@@ -365,5 +425,6 @@ module.exports = {
   validateSession,
   destroySession,
   extractTokenFromReq,
+  authorize,
   invalidateAuthConfigCache
 };

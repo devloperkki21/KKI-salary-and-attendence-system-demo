@@ -861,7 +861,7 @@ export default function App() {
                   </button>
                 </div>
                 <p className="text-[11px] text-slate-400 mt-1.5">
-                  Default Password: <strong className="text-amber-400 font-mono">kki123</strong> (Changeable in Rules & Settings)
+                  Enter your configured Admin / Payroll Unlock Password.
                 </p>
               </div>
 

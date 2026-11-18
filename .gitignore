@@ -5,13 +5,17 @@ node_modules/
 dist/
 build/
 
-# Database files
+# Database & legacy seed files (never commit local SQLite or seed dumps)
 data/*_backup*.db
 data/*.sqlite
 data/*.db-journal
 data/backups/
 *.db
+*.sqlite
+attendance.db
 data/attendance.db
+data/seed_data.json
+seed_data.json
 
 # Temporary uploaded files
 uploads/*
@@ -39,4 +43,5 @@ yarn-error.log*
 .claude/
 scratch/
 *.sql
+!supabase_attendance_schema.sql
 supabase_chunks/

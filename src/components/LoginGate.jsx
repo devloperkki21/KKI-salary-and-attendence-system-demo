@@ -535,7 +535,7 @@ export default function LoginGate({ onLoginSuccess, logoutReason, onClearLogoutR
                       type={showPassword ? 'text' : 'password'}
                       value={password}
                       onChange={(e) => { setPassword(e.target.value); setError(''); }}
-                      placeholder="Enter admin password (default: kki123)..."
+                      placeholder="Enter Master Admin Password..."
                       className="w-full bg-slate-950 border border-slate-700 rounded-xl pl-4 pr-10 py-2.5 text-sm text-white font-mono placeholder-slate-500 focus:outline-none focus:border-amber-500 transition-all"
                       autoFocus
                       required
@@ -548,9 +548,6 @@ export default function LoginGate({ onLoginSuccess, logoutReason, onClearLogoutR
                       {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                     </button>
                   </div>
-                  <p className="text-[11px] text-slate-400 mt-1.5">
-                    Default Initial Password: <strong className="text-amber-400 font-mono">kki123</strong>
-                  </p>
                 </div>
 
                 {error && (
